@@ -17,6 +17,7 @@ package pan
 import (
 	"context"
 	"fmt"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -25,6 +26,8 @@ import (
 	"github.com/scionproto/scion/pkg/addr"
 
 	"github.com/netsec-ethz/scion-apps/pkg/pan/internal/ping"
+
+	"github.com/netsec-ethz/scion-apps/bwtester/bwtest"
 )
 
 // Selector controls the path used by a single **dialed** socket. Stateful.
@@ -325,4 +328,115 @@ func (s *PingingSelector) Close() error {
 	}
 	s.pingerCancel()
 	return s.pinger.Close()
+}
+
+// LossAwareSelector implements the Selector interface and makes path decisions
+// based on remote loss metrics. It wraps an underlying DefaultSelector.
+type LossAwareSelector struct {
+	defaultSel                  *DefaultSelector    // underlying default selector (we have access to its internals)
+	lossMetrics                 *bwtest.LossMetrics // pointer to our loss metrics instance
+	inertia                     time.Duration       // minimum duration between path switches, e.g., 8 seconds
+	lossThreshold               float64             // loss percentage threshold, e.g., 10.0 for 10%
+	lastSwitch                  time.Time           // time when the last switch occurred
+	switchMutex                 sync.Mutex          // protects access to lastSwitch and cache fields
+	cacheDuration               time.Duration       // duration for which the loss average is cached
+	lastCacheUpdate             time.Time           // last time the cache was updated
+	lastSeenRemoteUpdateCounter uint32              // counter of the last remote update used for switching
+}
+
+// NewLossAwareSelector creates a new LossAwareSelector.
+// cacheDur specifies the duration to cache the loss value (e.g., 500ms).
+func NewLossAwareSelector(lossMetrics *bwtest.LossMetrics, inertia time.Duration, lossThreshold float64, cacheDur time.Duration) *LossAwareSelector {
+	return &LossAwareSelector{
+		defaultSel:                  NewDefaultSelector(),
+		lossMetrics:                 lossMetrics,
+		inertia:                     inertia,
+		lossThreshold:               lossThreshold,
+		lastSwitch:                  time.Now(),
+		cacheDuration:               cacheDur,
+		lastCacheUpdate:             time.Now().Add(-cacheDur),
+		lastSeenRemoteUpdateCounter: 0,
+	}
+}
+
+// WouldSwitch returns true if the average loss over the provided lossWindow exceeds the threshold.
+// This method is used by both the update sender and the Path method.
+// The decision criterion is simply: average loss > threshold.
+func (s *LossAwareSelector) WouldSwitch(lossWindow []float32) bool {
+	if len(lossWindow) == 0 {
+		return false
+	}
+	var sum float64
+	for _, loss := range lossWindow {
+		sum += float64(loss)
+	}
+	avgLoss := sum / float64(len(lossWindow))
+	return avgLoss > s.lossThreshold
+}
+
+// Path selects the path for the next packet. It accepts a context and delegates
+// to the underlying default selector's Path method, updating the cached remote loss.
+func (s *LossAwareSelector) Path(ctx context.Context) *Path {
+	ds := s.defaultSel
+	currentPath := ds.Path(ctx)
+	if currentPath == nil {
+		return nil
+	}
+
+	// If we are still in the caching period, do not fetch remote update and do not switch.
+	s.switchMutex.Lock()
+	defer s.switchMutex.Unlock()
+	now := time.Now()
+	if now.Sub(s.lastCacheUpdate) < s.cacheDuration {
+		return ds.Path(ctx)
+	}
+
+	// Check if there is a new remote update and update last seen update counter.
+	newRemoteUpdateCounter := s.lossMetrics.GetLastRemoteUpdate().UpdateCounter
+	seenNewUpdate := newRemoteUpdateCounter > s.lastSeenRemoteUpdateCounter
+	s.lastCacheUpdate = now
+	if seenNewUpdate {
+		s.lastSeenRemoteUpdateCounter = newRemoteUpdateCounter
+	}
+
+	// Switch only if sufficient time has passed since the last switch and new updates are still incoming
+	// Switch to an arbitrary path uniformly at random, including the current path.
+	if seenNewUpdate && now.Sub(s.lastSwitch) >= s.inertia {
+		numPaths := len(ds.paths)
+		if numPaths > 0 {
+			newIndex := rand.Intn(numPaths)
+			ds.mutex.Lock()
+			ds.current = newIndex
+			ds.mutex.Unlock()
+			s.lastSwitch = now
+			fmt.Printf("LossAwareSelector: switching path to index %d due to new remote update (counter: %d)\n", newIndex, newRemoteUpdateCounter)
+		}
+	}
+
+	return ds.Path(ctx)
+}
+
+// Initialize delegates initialization to the underlying default selector.
+func (s *LossAwareSelector) Initialize(local, remote UDPAddr, paths []*Path) {
+	s.defaultSel.Initialize(local, remote, paths)
+	s.switchMutex.Lock()
+	s.lastSwitch = time.Now()
+	s.lastCacheUpdate = time.Now().Add(-s.cacheDuration)
+	s.lastSeenRemoteUpdateCounter = 0
+	s.switchMutex.Unlock()
+}
+
+// Refresh delegates to the underlying default selector.
+func (s *LossAwareSelector) Refresh(paths []*Path) {
+	s.defaultSel.Refresh(paths)
+}
+
+// Currently not implemented, must avoid double switch from Path() method
+func (s *LossAwareSelector) PathDown(pf PathFingerprint, pi PathInterface) {
+	//s.defaultSel.PathDown(pf, pi)
+}
+
+// Close delegates to the underlying default selector.
+func (s *LossAwareSelector) Close() error {
+	return s.defaultSel.Close()
 }

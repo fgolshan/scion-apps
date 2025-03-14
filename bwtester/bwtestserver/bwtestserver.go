@@ -30,7 +30,8 @@ import (
 )
 
 const (
-	resultExpiry = time.Minute
+	resultExpiry          = time.Minute
+	SelectorLossThreshold = 10.0
 )
 
 func main() {
@@ -47,8 +48,12 @@ func runServer(listen netip.AddrPort) error {
 
 	var currentBwtest string
 	var currentBwtestFinish time.Time
-	currentResult := make(chan bwtest.Result)
+	// currentLossMetrics holds the active test's LossMetrics instance.
+	var currentLossMetrics *bwtest.LossMetrics
+	// currentLossUpdatesStopChan is used to stop loss update sending.
+	var currentLossUpdatesStopChan chan struct{}
 
+	currentResult := make(chan bwtest.Result)
 	results := make(resultsMap)
 
 	ctx := context.Background()
@@ -58,76 +63,127 @@ func runServer(listen netip.AddrPort) error {
 		return err
 	}
 	serverCCAddr := ccConn.LocalAddr().(pan.UDPAddr)
+
 	for {
-		// Handle client requests
+		// Check if a result from a background bwtest is available.
+		select {
+		case res := <-currentResult:
+			// Before inserting the result, stop sending loss updates.
+			if currentLossUpdatesStopChan != nil {
+				close(currentLossUpdatesStopChan)
+				currentLossUpdatesStopChan = nil
+			}
+			results.insert(currentBwtest, res)
+			// Reset the current test state.
+			currentBwtest = ""
+			currentBwtestFinish = time.Time{}
+			currentLossMetrics = nil
+		default:
+		}
+
 		n, clientCCAddr, err := ccConn.ReadFrom(receivePacketBuffer)
 		if err != nil {
 			return err
 		}
-		request := receivePacketBuffer[:n]
-		if n < 1 || (request[0] != 'N' && request[0] != 'R') {
+		if n < 1 {
 			continue
 		}
-
-		// Check (non-blocking) for result from test running in background:
-		select {
-		case res := <-currentResult:
-			results.insert(currentBwtest, res)
-			currentBwtest = ""
-			currentBwtestFinish = time.Time{}
-		default:
-		}
-
+		request := receivePacketBuffer[:n]
 		clientCCAddrStr := clientCCAddr.String()
 		fmt.Println("Received request:", string(request[0]), clientCCAddrStr)
 
-		if request[0] == 'N' {
-			// New bwtest request
-			if len(currentBwtest) != 0 {
+		switch request[0] {
+		case 'L':
+			// Process a loss metrics update message.
+			if clientCCAddrStr == currentBwtest && currentLossMetrics != nil {
+				if ctr, err := currentLossMetrics.ProcessRemoteUpdate(request); err != nil {
+					fmt.Printf("Error processing loss update from %s: %v\n", clientCCAddrStr, err)
+				} else {
+					fmt.Printf("Processed loss update (counter: %d) from %s\n", ctr, clientCCAddrStr)
+				}
+			} else {
+				fmt.Printf("Received loss update from %s, but no active test found.\n", clientCCAddrStr)
+			}
+			continue
+
+		case 'N':
+			// New bwtest request.
+			if currentBwtest != "" {
 				fmt.Println("A bwtest is already ongoing", currentBwtest)
 				if clientCCAddrStr == currentBwtest {
-					// The request is from the same client for which the current test is already ongoing
-					// If the response packet was dropped, then the client would send another request
-					// We simply send another response packet, indicating success
+					// Same client: re-send success response.
 					fmt.Println("clientCCAddrStr == currentBwtest")
 					writeResponseN(ccConn, clientCCAddr, 0)
 				} else {
-					// A bwtest is currently ongoing, so send back remaining duration
+					// Another client: send remaining duration.
 					writeResponseN(ccConn, clientCCAddr, retryWaitTime(currentBwtestFinish))
 				}
 				continue
 			}
 
+			// Decode the parameters.
 			clientBwp, serverBwp, err := decodeRequestN(request)
 			if err != nil {
 				continue
 			}
+			// Obtain the path from the selector.
 			path := ccSelector.Path(ctx, clientCCAddr.(pan.UDPAddr))
-			finishTime, err := startBwtestBackground(serverCCAddr, clientCCAddr.(pan.UDPAddr), path,
+			// Start the bwtest in background, which returns finishTime and the LossMetrics instance.
+			finishTime, lossMet, err := startBwtestBackground(serverCCAddr, clientCCAddr.(pan.UDPAddr), path,
 				clientBwp, serverBwp, currentResult)
 			if err != nil {
-				// Ask the client to try again in 1 second
+				// Ask the client to try again in 1 second.
 				writeResponseN(ccConn, clientCCAddr, 1)
 				continue
 			}
+			// Save current state.
 			currentBwtest = clientCCAddrStr
 			currentBwtestFinish = finishTime
-			// Send back success
+			currentLossMetrics = lossMet
+
+			// Start sending loss update messages.
+			currentLossUpdatesStopChan = make(chan struct{})
+			measurementInterval := bwtest.LossMetricsMeasurementInterval
+			expectedRate := float64(clientBwp.NumPackets) / clientBwp.BwtestDuration.Seconds()
+			expectedPerInterval := expectedRate * measurementInterval.Seconds()
+
+			sendFunc := func(msg []byte) error {
+				_, err := ccConn.WriteTo(msg, clientCCAddr)
+				return err
+			}
+
+			// When using a LossAwareSelector for the server as well, can use its wouldSwitch method.
+			wouldSwitch := func(lossWindow []float32) bool {
+				if len(lossWindow) == 0 {
+					return false
+				}
+				var sum float64
+				for _, loss := range lossWindow {
+					sum += float64(loss)
+				}
+				avgLoss := sum / float64(len(lossWindow))
+				return avgLoss > SelectorLossThreshold
+			}
+			currentLossMetrics.StartSendingUpdates(bwtest.LossMetricsUpdateInterval, expectedPerInterval, wouldSwitch, sendFunc, currentLossUpdatesStopChan)
+
 			writeResponseN(ccConn, clientCCAddr, 0)
-		} else if request[0] == 'R' {
+
+		case 'R':
+			// Request for results.
 			if clientCCAddrStr == currentBwtest {
-				// test is still ongoing, send back remaining duration
+				// Test still ongoing; reply with remaining time.
 				writeResponseR(ccConn, clientCCAddr, retryWaitTime(currentBwtestFinish), nil)
 				continue
 			}
-
 			v, ok := results[clientCCAddrStr]
 			if !ok || !bytes.Equal(v.PrgKey, request[1:]) {
-				// There are no results for this client or incorrect PRG, return an error
 				writeResponseR(ccConn, clientCCAddr, 127, nil)
 				continue
 			}
 			writeResponseR(ccConn, clientCCAddr, 0, &v.Result)
+
+		default:
+			continue
 		}
 	}
 }
@@ -135,7 +191,7 @@ func runServer(listen netip.AddrPort) error {
 // startBwtestBackground starts a bandwidth test, in the background.
 // Returns the expected finish time of the test, or any error during the setup.
 func startBwtestBackground(serverCCAddr pan.UDPAddr, clientCCAddr pan.UDPAddr,
-	path *pan.Path, clientBwp, serverBwp bwtest.Parameters, res chan<- bwtest.Result) (time.Time, error) {
+	path *pan.Path, clientBwp, serverBwp bwtest.Parameters, res chan<- bwtest.Result) (time.Time, *bwtest.LossMetrics, error) {
 
 	// Data Connection addresses:
 	clientDCAddr := clientCCAddr
@@ -146,7 +202,7 @@ func startBwtestBackground(serverCCAddr pan.UDPAddr, clientCCAddr pan.UDPAddr,
 	dcSelector := initializedReplySelector(clientDCAddr, path)
 	dcConn, err := listenConnected(serverDCAddr, clientDCAddr, dcSelector)
 	if err != nil {
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 
 	now := time.Now()
@@ -158,12 +214,20 @@ func startBwtestBackground(serverCCAddr pan.UDPAddr, clientCCAddr pan.UDPAddr,
 	}
 	if err := dcConn.SetReadDeadline(finishTimeReceive); err != nil {
 		dcConn.Close()
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
 	if err := dcConn.SetWriteDeadline(finishTimeSend); err != nil {
 		dcConn.Close()
-		return time.Time{}, err
+		return time.Time{}, nil, err
 	}
+
+	// --- Set up loss metrics for incoming packets (client -> server) ---
+	lossMetrics := bwtest.NewLossMetrics(bwtest.LossMetricsWindowSize)
+	measurementInterval := bwtest.LossMetricsMeasurementInterval
+	expectedRate := float64(clientBwp.NumPackets) / clientBwp.BwtestDuration.Seconds()
+	expectedPerInterval := expectedRate * measurementInterval.Seconds()
+	stopChan := make(chan struct{})
+	lossMetrics.StartMonitoring(measurementInterval, expectedPerInterval, stopChan)
 
 	sendDone := make(chan struct{})
 	go func() {
@@ -171,12 +235,15 @@ func startBwtestBackground(serverCCAddr pan.UDPAddr, clientCCAddr pan.UDPAddr,
 		close(sendDone)
 	}()
 	go func() {
-		r := bwtest.HandleDCConnReceive(clientBwp, dcConn)
+		// Pass lossMetrics to HandleDCConnReceive so that each correctly received packet is counted.
+		r := bwtest.HandleDCConnReceive(clientBwp, dcConn, lossMetrics)
 		<-sendDone
 		dcConn.Close()
+		// Stop the loss monitoring.
+		close(stopChan)
 		res <- r
 	}()
-	return finishTime, nil
+	return finishTime, lossMetrics, nil
 }
 
 // writeResponseN writes the response to an 'N' (new bandwidth test) request.

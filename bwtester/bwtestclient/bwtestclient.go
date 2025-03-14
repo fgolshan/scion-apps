@@ -45,6 +45,9 @@ const (
 	MaxTries               = 5 // Number of times to try to reach server
 	Timeout  time.Duration = time.Millisecond * 500
 	MaxRTT   time.Duration = time.Millisecond * 1000
+
+	SelectorInertiaPeriod = 10 * time.Second
+	SelectorLossThreshold = 10.0
 )
 
 func prepareAESKey() []byte {
@@ -333,38 +336,109 @@ func main() {
 func runBwtest(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy,
 	clientBwp, serverBwp bwtest.Parameters) (clientRes, serverRes bwtest.Result, err error) {
 
-	// Control channel connection
-	ccSelector := pan.NewDefaultSelector()
-	ccConn, err := pan.DialUDP(context.Background(), local, serverCCAddr, pan.WithPolicy(policy), pan.WithSelector(ccSelector))
+	ctx := context.Background()
+
+	// Instantiate LossMetrics (but don't start monitoring yet).
+	lossMetrics := bwtest.NewLossMetrics(bwtest.LossMetricsWindowSize)
+
+	// Create our custom LossAwareSelector with an inertia period and a loss threshold
+	mySelector := pan.NewLossAwareSelector(lossMetrics, SelectorInertiaPeriod, SelectorLossThreshold, bwtest.LossMetricsUpdateInterval/2)
+
+	// Set up the control channel using our custom selector.
+	ccConn, err := pan.DialUDP(ctx, local, serverCCAddr, pan.WithPolicy(policy), pan.WithSelector(mySelector))
 	if err != nil {
 		return
 	}
 
+	// Set up the data channel using the same custom selector.
 	dcLocal := netip.AddrPortFrom(local.Addr(), 0)
-	// Address of server data channel (DC)
 	serverDCAddr := serverCCAddr.WithPort(serverCCAddr.Port + 1)
-
-	// Data channel connection
-	dcConn, err := pan.DialUDP(context.Background(), dcLocal, serverDCAddr, pan.WithPolicy(policy))
+	dcConn, err := pan.DialUDP(ctx, dcLocal, serverDCAddr, pan.WithPolicy(policy), pan.WithSelector(mySelector))
 	if err != nil {
 		return
 	}
 	clientDCAddr := dcConn.LocalAddr().(pan.UDPAddr)
-	// DC ports are passed in the request
 	clientBwp.Port = clientDCAddr.Port
 	serverBwp.Port = serverDCAddr.Port
 
-	// Start receiver before even sending the request so it will be ready.
+	// Start the data channel receiver immediately so that no packets are missed.
 	receiveRes := make(chan bwtest.Result, 1)
 	go func() {
-		receiveRes <- bwtest.HandleDCConnReceive(serverBwp, dcConn)
+		// Pass lossMetrics to HandleDCConnReceive so that each correctly received packet is counted.
+		receiveRes <- bwtest.HandleDCConnReceive(serverBwp, dcConn, lossMetrics)
 	}()
 
-	// Send the request; when this finishes, the server may have already started blasting.
+	// Perform the bwtest handshake (requestNewBwtest) to get the expected 'N' response.
 	err = requestNewBwtest(ccConn, clientBwp, serverBwp)
 	if err != nil {
 		return
 	}
+
+	// Now that the handshake is complete, start loss metrics monitoring and update routines.
+	// For monitoring the loss rates it does not matter if we miss a few packets at the beginning
+	// However we don't want to start too early as this could cause less packets to arrive than expected
+	expectedRate := float64(clientBwp.NumPackets) / clientBwp.BwtestDuration.Seconds()
+	expectedPerInterval := expectedRate * bwtest.LossMetricsMeasurementInterval.Seconds()
+	stopMonitorChan := make(chan struct{})
+	lossMetrics.StartMonitoring(bwtest.LossMetricsMeasurementInterval, expectedPerInterval, stopMonitorChan)
+
+	// Define a stop and a done channel for the update receiver.
+	updateStopChan := make(chan struct{})
+	updateDone := make(chan struct{})
+	// Start a goroutine to process incoming loss update messages from the control channel.
+	go func() {
+		buf := make([]byte, 2000)
+		for {
+			// Use select to check if a stop has been signaled.
+			select {
+			case <-updateStopChan:
+				fmt.Println("Update receiver stopping.")
+				// Signal to the main goroutine that it may proceed with requesting the results
+				close(updateDone)
+				return
+			default:
+				// Proceed with reading.
+			}
+
+			// Set an explicit read deadline using MaxRTT.
+			ccConn.SetReadDeadline(time.Now().Add(MaxRTT))
+
+			n, err := ccConn.Read(buf)
+			if err != nil {
+				// If it's a timeout error, continue.
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					continue
+				}
+				fmt.Printf("Error reading from ccConn: %v\n", err)
+				break
+			}
+			if n < 1 {
+				continue
+			}
+			if buf[0] == 'L' {
+				if ctr, err := lossMetrics.ProcessRemoteUpdate(buf[:n]); err != nil {
+					fmt.Printf("Error processing remote loss update: %v\n", err)
+				} else {
+					fmt.Printf("Client processed remote loss update (counter: %d)\n", ctr)
+				}
+			} else {
+				err := fmt.Errorf("unexpected message type %c in loss update receiver", buf[0])
+				fmt.Printf("Fatal error: %v\n", err)
+				break
+			}
+		}
+	}()
+
+	// Start sending loss update messages over the control channel.
+	stopSendChan := make(chan struct{})
+	sendFunc := func(msg []byte) error {
+		_, err := ccConn.Write(msg)
+		return err
+	}
+	lossMetrics.StartSendingUpdates(bwtest.LossMetricsUpdateInterval, expectedPerInterval, mySelector.WouldSwitch, sendFunc, stopSendChan)
+
+	// Set deadlines on the data channel.
 	startTime := time.Now()
 	finishTimeReceive := startTime.Add(serverBwp.BwtestDuration + bwtest.StragglerWaitPeriod)
 	finishTimeSend := startTime.Add(clientBwp.BwtestDuration + bwtest.GracePeriodSend)
@@ -377,22 +451,25 @@ func runBwtest(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy
 		return
 	}
 
-	// Pin DC to path used for request
-	if serverDCAddr.IA != clientDCAddr.IA {
-		dcConn.SetPolicy(pan.Pinned{ccSelector.Path(context.Background()).Fingerprint})
-	}
-
-	// Start blasting client->server
+	// With dynamic switching, we simply rely on the selector (passed via WithSelector) for the data channel.
+	// The pan package will invoke mySelector.Path(ctx) on each write.
+	// Start sending data over the data channel.
 	err = bwtest.HandleDCConnSend(clientBwp, dcConn)
 	if err != nil && !errors.Is(err, os.ErrDeadlineExceeded) {
 		dcConn.Close()
 		return
 	}
-
-	// Wait until receive is done as well
 	clientRes = <-receiveRes
 	dcConn.Close()
 
+	// Stop loss monitoring and update sending and receiving.
+	close(stopMonitorChan)
+	close(stopSendChan)
+	close(updateStopChan)
+	// Wait for the update receiver to finish.
+	<-updateDone
+
+	// Retrieve the test results via the control channel.
 	serverRes, err = requestResults(ccConn, clientBwp.PrgKey)
 	return
 }
