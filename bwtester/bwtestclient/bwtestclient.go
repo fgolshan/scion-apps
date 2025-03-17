@@ -46,8 +46,11 @@ const (
 	Timeout  time.Duration = time.Millisecond * 500
 	MaxRTT   time.Duration = time.Millisecond * 1000
 
-	SelectorInertiaPeriod = 10 * time.Second
-	SelectorLossThreshold = 10.0
+	SelectorInertiaPeriod = 10 * time.Second       // Period of no path switching after a switch
+	SelectorLossThreshold = 10.0                   // Loss rate threshold for switching paths
+	SelectorLatencyCutoff = 1.2                    // Factor multiplied with lowest path latency to determine cutoff for candidate paths
+	SelectorPingInterval  = 1 * time.Second        // Interval between pings to collect path latencies
+	SelectorPingTimeout   = 500 * time.Millisecond // Timeout for a single ping
 )
 
 func prepareAESKey() []byte {
@@ -342,8 +345,10 @@ func runBwtest(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy
 	lossMetrics := bwtest.NewLossMetrics(bwtest.LossMetricsWindowSize)
 
 	// Create our custom LossAwareSelector with an inertia period and a loss threshold
-	mySelector := pan.NewLossAwareSelector(lossMetrics, SelectorInertiaPeriod, SelectorLossThreshold, bwtest.LossMetricsUpdateInterval/2)
+	// mySelector := pan.NewLossAwareSelector(lossMetrics, SelectorInertiaPeriod, SelectorLossThreshold, bwtest.LossMetricsUpdateInterval/2)
 
+	// Create our custom LossAndPingAwareSelector with an inertia period, a loss threshold, a latency cutoff, and ping parameters
+	mySelector := pan.NewLossAndPingAwareSelector(SelectorLatencyCutoff, SelectorLossThreshold, SelectorInertiaPeriod, SelectorPingInterval, SelectorPingTimeout, lossMetrics)
 	// Set up the control channel using our custom selector.
 	ccConn, err := pan.DialUDP(ctx, local, serverCCAddr, pan.WithPolicy(policy), pan.WithSelector(mySelector))
 	if err != nil {

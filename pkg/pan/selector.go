@@ -330,15 +330,15 @@ func (s *PingingSelector) Close() error {
 	return s.pinger.Close()
 }
 
-// LossAwareSelector implements the Selector interface and makes path decisions
+// LossAwareSelector implements the Selector interface and makes simple path selection decisions
 // based on remote loss metrics. It wraps an underlying DefaultSelector.
 type LossAwareSelector struct {
 	defaultSel                  *DefaultSelector    // underlying default selector (we have access to its internals)
 	lossMetrics                 *bwtest.LossMetrics // pointer to our loss metrics instance
 	inertia                     time.Duration       // minimum duration between path switches, e.g., 8 seconds
 	lossThreshold               float64             // loss percentage threshold, e.g., 10.0 for 10%
+	cacheMutex                  sync.Mutex          // protects access to lastSwitch and cache fields
 	lastSwitch                  time.Time           // time when the last switch occurred
-	switchMutex                 sync.Mutex          // protects access to lastSwitch and cache fields
 	cacheDuration               time.Duration       // duration for which the loss average is cached
 	lastCacheUpdate             time.Time           // last time the cache was updated
 	lastSeenRemoteUpdateCounter uint32              // counter of the last remote update used for switching
@@ -360,8 +360,6 @@ func NewLossAwareSelector(lossMetrics *bwtest.LossMetrics, inertia time.Duration
 }
 
 // WouldSwitch returns true if the average loss over the provided lossWindow exceeds the threshold.
-// This method is used by both the update sender and the Path method.
-// The decision criterion is simply: average loss > threshold.
 func (s *LossAwareSelector) WouldSwitch(lossWindow []float32) bool {
 	if len(lossWindow) == 0 {
 		return false
@@ -383,16 +381,17 @@ func (s *LossAwareSelector) Path(ctx context.Context) *Path {
 		return nil
 	}
 
+	// TODO: The caching mechanism can be removed, since we now use atomic loads to receive the update counter.
 	// If we are still in the caching period, do not fetch remote update and do not switch.
-	s.switchMutex.Lock()
-	defer s.switchMutex.Unlock()
+	s.cacheMutex.Lock()
+	defer s.cacheMutex.Unlock()
 	now := time.Now()
 	if now.Sub(s.lastCacheUpdate) < s.cacheDuration {
 		return ds.Path(ctx)
 	}
 
 	// Check if there is a new remote update and update last seen update counter.
-	newRemoteUpdateCounter := s.lossMetrics.GetLastRemoteUpdate().UpdateCounter
+	newRemoteUpdateCounter := s.lossMetrics.GetLastRemoteUpdateCounter()
 	seenNewUpdate := newRemoteUpdateCounter > s.lastSeenRemoteUpdateCounter
 	s.lastCacheUpdate = now
 	if seenNewUpdate {
@@ -419,11 +418,11 @@ func (s *LossAwareSelector) Path(ctx context.Context) *Path {
 // Initialize delegates initialization to the underlying default selector.
 func (s *LossAwareSelector) Initialize(local, remote UDPAddr, paths []*Path) {
 	s.defaultSel.Initialize(local, remote, paths)
-	s.switchMutex.Lock()
+	s.cacheMutex.Lock()
 	s.lastSwitch = time.Now()
 	s.lastCacheUpdate = time.Now().Add(-s.cacheDuration)
-	s.lastSeenRemoteUpdateCounter = 0
-	s.switchMutex.Unlock()
+	s.lastSeenRemoteUpdateCounter = s.lossMetrics.GetLastRemoteUpdateCounter()
+	s.cacheMutex.Unlock()
 }
 
 // Refresh delegates to the underlying default selector.
@@ -439,4 +438,231 @@ func (s *LossAwareSelector) PathDown(pf PathFingerprint, pi PathInterface) {
 // Close delegates to the underlying default selector.
 func (s *LossAwareSelector) Close() error {
 	return s.defaultSel.Close()
+}
+
+// The following code implements a LossAndPingAwareSelector. Just as the LossAwareSelector, it
+// makes path selection decisions based on remote loss metrics. However, it previouly computes
+// a candidate set of paths based on Pinging metrics.
+
+// getLatestLatency returns the most recent latency for path p toward destination dst.
+// It looks up the destination's latency samples in the global stats database.
+// If no valid latency is recorded for p, or if the path was notified down after the sample was taken,
+// it returns a very high duration (maxDuration).
+func getLatestLatency(dst scionAddr, p *Path) time.Duration {
+	const maxDuration = time.Duration(1<<63 - 1)
+	stats.mutex.RLock()
+	defer stats.mutex.RUnlock()
+
+	dstStats, ok := stats.destinations[dst]
+	if !ok {
+		return maxDuration
+	}
+	samples, ok := dstStats.Latency[p.Fingerprint]
+	if !ok || len(samples) == 0 {
+		return maxDuration
+	}
+	latestSample := samples[0] // assume samples[0] is the most recent sample
+
+	// Check if the path was notified down after the latency sample was taken.
+	downTime := stats.newestDownNotification(p)
+	if downTime.After(latestSample.Time) {
+		return maxDuration
+	}
+
+	return latestSample.Value
+}
+
+// CandidatePaths returns a subset of paths that have a valid latency measurement and whose latency
+// is within cutoff times the minimum measured latency among all paths.
+// If no valid latency measurement is found (i.e. all paths are effectively down), it returns all paths.
+func CandidatePaths(dst scionAddr, paths []*Path, cutoff float64) []*Path {
+	const maxDuration = time.Duration(1<<63 - 1)
+
+	var valid []struct {
+		p   *Path
+		lat time.Duration
+	}
+	minLatency := maxDuration
+	for _, p := range paths {
+		lat := getLatestLatency(dst, p)
+		// Consider a latency valid if it is less than maxDuration.
+		if lat < maxDuration {
+			valid = append(valid, struct {
+				p   *Path
+				lat time.Duration
+			}{p, lat})
+			if lat < minLatency {
+				minLatency = lat
+			}
+		}
+	}
+	// If no valid measurements exist, return all paths.
+	if len(valid) == 0 {
+		return paths
+	}
+	// Define cutoff duration.
+	cutoffDuration := time.Duration(float64(minLatency) * cutoff)
+	var candidates []*Path
+	for _, v := range valid {
+		if v.lat <= cutoffDuration {
+			candidates = append(candidates, v.p)
+		}
+	}
+	// Fallback: if candidate subset is empty (should not happen if one path responded), return all paths.
+	if len(candidates) == 0 {
+		return paths
+	}
+	return candidates
+}
+
+// LossAndPingAwareSelector combines loss awareness with ping-based preselection.
+// It wraps an underlying PingingSelector and a LossMetrics instance. It caches the
+// currently selected path and only triggers a switch when a new remote loss update is observed
+// (its counter is higher than the stored one) and the inertia period has elapsed.
+// When switching, it computes the candidate set using CandidatePaths (which orders paths by
+// latency and omits paths that are down) and selects uniformly at random from that subset.
+type LossAndPingAwareSelector struct {
+	pingSel     *PingingSelector    // underlying ping selector (must be running and updating latencies)
+	lossMetrics *bwtest.LossMetrics // provides remote loss update information
+
+	cutoff        float64       // cutoff is the multiplicative factor; e.g., 1.2 means select all paths with latency ≤ 1.2× best.
+	inertia       time.Duration // minimum time between switches
+	lossThreshold float64       // loss percentage threshold for switching
+
+	mutex                       sync.Mutex // protects cachedPath and switching fields
+	cachedPath                  *Path      // currently selected path
+	lastSwitch                  time.Time  // time when the last switch was triggered
+	lastSeenRemoteUpdateCounter uint32     // last remote update counter that triggered a switch
+}
+
+// NewLossAndPingAwareSelector creates a new LossAndPingAwareSelector.
+// The parameters are:
+//   - cutoff: e.g. 1.2 for 20% above the best latency,
+//   - inertia: minimum time between switches,
+//   - pingInterval and pingTimeout: parameters for the underlying ping selector,
+//   - lossMetrics: pointer to the LossMetrics instance.
+func NewLossAndPingAwareSelector(cutoff, lossThreshold float64, inertia, pingInterval, pingTimeout time.Duration, lossMetrics *bwtest.LossMetrics) *LossAndPingAwareSelector {
+	// Instantiate the underlying ping selector.
+	ps := &PingingSelector{
+		Interval: pingInterval,
+		Timeout:  pingTimeout,
+		// Other fields will be set in Initialize.
+	}
+	// Do not call ensureRunning() here; it will be called in Initialize via SetActive.
+	return &LossAndPingAwareSelector{
+		pingSel:                     ps,
+		lossMetrics:                 lossMetrics,
+		cutoff:                      cutoff,
+		inertia:                     inertia,
+		lossThreshold:               lossThreshold,
+		lastSwitch:                  time.Now(),
+		lastSeenRemoteUpdateCounter: 0,
+	}
+}
+
+// WouldSwitch returns true if the average loss over the provided lossWindow exceeds the threshold.
+func (s *LossAndPingAwareSelector) WouldSwitch(lossWindow []float32) bool {
+	if len(lossWindow) == 0 {
+		return false
+	}
+	var sum float64
+	for _, loss := range lossWindow {
+		sum += float64(loss)
+	}
+	avgLoss := sum / float64(len(lossWindow))
+	return avgLoss > s.lossThreshold
+}
+
+// Initialize delegates initialization to the underlying ping selector,
+// then sets NumActive to ensure that all paths are actively probed,
+// and initializes our cached path.
+func (s *LossAndPingAwareSelector) Initialize(local, remote UDPAddr, paths []*Path) {
+	s.pingSel.Initialize(local, remote, paths)
+	s.pingSel.SetActive(len(paths))
+	s.mutex.Lock()
+	// Lock the underlying ping selector to safely copy its paths and remote.
+	s.pingSel.mutex.Lock()
+	if len(s.pingSel.paths) == 0 {
+		s.cachedPath = nil
+	} else {
+		s.cachedPath = s.pingSel.paths[0]
+	}
+	s.pingSel.mutex.Unlock()
+	s.lastSwitch = time.Now()
+	s.lastSeenRemoteUpdateCounter = s.lossMetrics.GetLastRemoteUpdateCounter()
+	s.mutex.Unlock()
+}
+
+// Refresh delegates to the underlying ping selector.
+// TODO: Currently this has no direct effect on path selection
+func (s *LossAndPingAwareSelector) Refresh(paths []*Path) {
+	s.pingSel.Refresh(paths)
+}
+
+// PathDown delegates to the underlying ping selector.
+// TODO: Currently not implemented, avoid interference with Path() method
+func (s *LossAndPingAwareSelector) PathDown(pf PathFingerprint, pi PathInterface) {
+	// s.pingSel.PathDown(pf, pi)
+}
+
+// Close delegates to the underlying ping selector.
+func (s *LossAndPingAwareSelector) Close() error {
+	return s.pingSel.Close()
+}
+
+// Path selects the path for the next packet.
+// It returns the cached path unless a new remote loss update is available (i.e.,
+// its counter is higher than the stored counter) and the inertia period has elapsed.
+// When switching is triggered, it builds a candidate set of paths using CandidatePaths()
+// (which orders paths by increasing latency and omits paths that are down) and selects one
+// uniformly at random from that subset. If the candidate set is empty (which should only happen if
+// there are no paths), it returns nil.
+func (s *LossAndPingAwareSelector) Path(ctx context.Context) *Path {
+	s.mutex.Lock()
+	defer s.mutex.Unlock()
+
+	remoteUpdateCounter := s.lossMetrics.GetLastRemoteUpdateCounter()
+	// If no new remote update is available, return the cached path.
+	if remoteUpdateCounter <= s.lastSeenRemoteUpdateCounter {
+		return s.cachedPath
+	}
+	// New update available; update stored counter.
+	s.lastSeenRemoteUpdateCounter = remoteUpdateCounter
+
+	now := time.Now()
+	// Only switch if the inertia period has elapsed.
+	if now.Sub(s.lastSwitch) < s.inertia {
+		return s.cachedPath
+	}
+
+	// Ensure underlying pingSel has candidate paths.
+	s.pingSel.mutex.Lock()
+	if len(s.pingSel.paths) == 0 {
+		s.pingSel.mutex.Unlock()
+		return nil
+	}
+	// Make a copy of the candidate paths.
+	pathsCopy := make([]*Path, len(s.pingSel.paths))
+	copy(pathsCopy, s.pingSel.paths)
+	// Also read the remote address.
+	remoteAddr := s.pingSel.remote
+	s.pingSel.mutex.Unlock()
+
+	// Build candidate subset using our helper function.
+	candidates := CandidatePaths(remoteAddr, pathsCopy, s.cutoff)
+	if len(candidates) == 0 {
+		// This should only occur if there are no paths.
+		s.cachedPath = nil
+		return nil
+	}
+
+	fmt.Printf("Preparing to switch paths, identified %d candidates out of %d paths\n", len(candidates), len(pathsCopy))
+
+	// Choose uniformly at random from the candidate subset.
+	newPath := candidates[rand.Intn(len(candidates))]
+	s.cachedPath = newPath
+	s.lastSwitch = now
+	fmt.Printf("LossAndPingAwareSelector: switching path due to new remote update (counter: %d); selected path with latency %v\n",
+		remoteUpdateCounter, getLatestLatency(remoteAddr, newPath))
+	return s.cachedPath
 }

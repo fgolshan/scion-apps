@@ -260,7 +260,7 @@ func aggrInterArrivalTime(bwr map[int]int64) (IPAvar, IPAmin, IPAavg, IPAmax int
 
 // RemoteLossUpdate stores the most recent loss update received from the remote side.
 type RemoteLossUpdate struct {
-	UpdateCounter uint32
+	UpdateCounter atomic.Uint32
 	SlidingWindow []float32 // loss percentages for each interval
 	ReceivedAt    time.Time
 }
@@ -397,37 +397,38 @@ func (lm *LossMetrics) GenerateUpdate(expectedPerInterval float64) ([]byte, erro
 
 // DecodeLossUpdate decodes a loss update message and returns a RemoteLossUpdate.
 // It expects the format defined in GenerateUpdate.
-func DecodeLossUpdate(data []byte) (RemoteLossUpdate, error) {
+func DecodeLossUpdate(data []byte) (*RemoteLossUpdate, error) {
 	r := bytes.NewReader(data)
 	// Check message type.
 	msgType, err := r.ReadByte()
 	if err != nil {
-		return RemoteLossUpdate{}, err
+		return &RemoteLossUpdate{}, err
 	}
 	if msgType != 'L' {
-		return RemoteLossUpdate{}, fmt.Errorf("invalid loss update message type: %c", msgType)
+		return &RemoteLossUpdate{}, fmt.Errorf("invalid loss update message type: %c", msgType)
 	}
 	var counter uint32
 	if err := binary.Read(r, binary.BigEndian, &counter); err != nil {
-		return RemoteLossUpdate{}, err
+		return &RemoteLossUpdate{}, err
 	}
 	var windowLen uint32
 	if err := binary.Read(r, binary.BigEndian, &windowLen); err != nil {
-		return RemoteLossUpdate{}, err
+		return &RemoteLossUpdate{}, err
 	}
 	slidingWindow := make([]float32, windowLen)
 	for i := uint32(0); i < windowLen; i++ {
 		var lossPercent float32
 		if err := binary.Read(r, binary.BigEndian, &lossPercent); err != nil {
-			return RemoteLossUpdate{}, err
+			return &RemoteLossUpdate{}, err
 		}
 		slidingWindow[i] = lossPercent
 	}
-	return RemoteLossUpdate{
-		UpdateCounter: counter,
+	remoteLossUpdate := RemoteLossUpdate{
 		SlidingWindow: slidingWindow,
 		ReceivedAt:    time.Now(),
-	}, nil
+	}
+	remoteLossUpdate.UpdateCounter.Store(counter)
+	return &remoteLossUpdate, nil
 }
 
 // ProcessRemoteUpdate decodes an incoming loss update message and stores it
@@ -440,27 +441,37 @@ func (lm *LossMetrics) ProcessRemoteUpdate(data []byte) (uint32, error) {
 	lm.muRemote.Lock()
 	defer lm.muRemote.Unlock()
 	// Only update if the new counter is greater than the stored one.
-	if update.UpdateCounter > lm.lastRemoteUpdate.UpdateCounter {
-		lm.lastRemoteUpdate = update
+	lastRemoteUpdateCounter := lm.lastRemoteUpdate.UpdateCounter.Load()
+	updateCounter := update.UpdateCounter.Load()
+	if updateCounter > lastRemoteUpdateCounter {
+		lm.lastRemoteUpdate.SlidingWindow = update.SlidingWindow
+		lm.lastRemoteUpdate.ReceivedAt = update.ReceivedAt
+		lm.lastRemoteUpdate.UpdateCounter.Store(updateCounter)
 	} else {
 		// Optionally log that an older or duplicate update was ignored.
 		fmt.Printf("Ignored remote loss update with counter %d (current: %d)\n",
-			update.UpdateCounter, lm.lastRemoteUpdate.UpdateCounter)
+			updateCounter, lastRemoteUpdateCounter)
 	}
-	return lm.lastRemoteUpdate.UpdateCounter, nil
+	return updateCounter, nil
 }
 
 // GetLastRemoteUpdate returns a copy of the last remote loss update received.
-func (lm *LossMetrics) GetLastRemoteUpdate() RemoteLossUpdate {
+func (lm *LossMetrics) GetLastRemoteUpdate() *RemoteLossUpdate {
 	lm.muRemote.Lock()
 	defer lm.muRemote.Unlock()
 	cpy := make([]float32, len(lm.lastRemoteUpdate.SlidingWindow))
 	copy(cpy, lm.lastRemoteUpdate.SlidingWindow)
-	return RemoteLossUpdate{
-		UpdateCounter: lm.lastRemoteUpdate.UpdateCounter,
+	remoteLossUpdate := RemoteLossUpdate{
 		SlidingWindow: cpy,
 		ReceivedAt:    lm.lastRemoteUpdate.ReceivedAt,
 	}
+	remoteLossUpdate.UpdateCounter.Store(lm.lastRemoteUpdate.UpdateCounter.Load())
+	return &remoteLossUpdate
+}
+
+// For better performance, if only the update counter is needed
+func (lm *LossMetrics) GetLastRemoteUpdateCounter() uint32 {
+	return lm.lastRemoteUpdate.UpdateCounter.Load()
 }
 
 // StartSendingUpdates starts a goroutine that, every updateInterval,
