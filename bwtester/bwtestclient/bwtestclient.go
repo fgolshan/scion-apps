@@ -46,9 +46,9 @@ const (
 	Timeout  time.Duration = time.Millisecond * 500
 	MaxRTT   time.Duration = time.Millisecond * 1000
 
-	SelectorInertiaPeriod = 10 * time.Second       // Period of no path switching after a switch
+	SelectorInertiaPeriod = 8 * time.Second        // Period of no path switching after a switch
 	SelectorLossThreshold = 10.0                   // Loss rate threshold for switching paths
-	SelectorLatencyCutoff = 1.2                    // Factor multiplied with lowest path latency to determine cutoff for candidate paths
+	SelectorLatencyCutoff = 1.5                    // Factor multiplied with lowest path latency to determine cutoff for candidate paths
 	SelectorPingInterval  = 1 * time.Second        // Interval between pings to collect path latencies
 	SelectorPingTimeout   = 500 * time.Millisecond // Timeout for a single ping
 )

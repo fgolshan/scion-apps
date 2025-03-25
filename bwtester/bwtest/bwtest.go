@@ -46,11 +46,11 @@ const (
 	// Make sure the port number is a port the server application can connect to
 	MinPort uint16 = 1024
 	// The number of intervals for which loss metrics are kept
-	LossMetricsWindowSize = 2
+	LossMetricsWindowSize = 3
 	// Interval for counting received packets to comput loss
-	LossMetricsMeasurementInterval = time.Second
+	LossMetricsMeasurementInterval = time.Second / 4
 	// Interval for sending loss updates
-	LossMetricsUpdateInterval = LossMetricsMeasurementInterval / 4
+	LossMetricsUpdateInterval = LossMetricsMeasurementInterval / 2
 )
 
 type Parameters struct {
@@ -486,7 +486,7 @@ func (lm *LossMetrics) StartSendingUpdates(updateInterval time.Duration, expecte
 				// First check if we should send an update.
 				measurements := lm.GetMeasurements()
 				losses := make([]float32, len(measurements))
-				for i, count := range lm.measurements {
+				for i, count := range measurements {
 					losses[i] = computeLossPercentage(count, expectedPerInterval)
 				}
 				if !wouldSwitch(losses) {
