@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -444,12 +445,79 @@ func (s *LossAwareSelector) Close() error {
 // makes path selection decisions based on remote loss metrics. However, it previouly computes
 // a candidate set of paths based on Pinging metrics.
 
+// Define the state constants for the LossAndPingAwareSelector.
+const (
+	stateNormal  = iota // 0: Normal operation.
+	stateInertia        // 1: In inertia period after a switch decision (or a decision not to switch).
+	stateWaiting        // 2: Random waiting period scheduled for switching.
+	stateReady          // 3: Ready-to-switch state (waiting for a new update to trigger immediate switch).
+)
+
+type LossAndPingAwareSelector struct {
+	pingSel     *PingingSelector    // underlying ping selector (must be running and updating latencies)
+	lossMetrics *bwtest.LossMetrics // provides remote loss update information
+
+	cutoffAbs     float64       // cutoffAbs is the multiplicative factor for absolute latency; e.g., 1.2 means select all paths with latency ≤ 1.2× best.
+	cutoffDiff    float64       // cutoffDiff is the multiplicative factor for the latency difference; e.g., 1.2 means select all paths with latency difference from min ≤ 1.2× best.
+	inertia       time.Duration // minimum time between switches
+	lossThreshold float64       // loss percentage threshold for switching
+
+	mutex                       sync.Mutex // protects cachedPath and switching fields
+	switchState                 int        // current state of the selector
+	cachedPath                  *Path      // currently selected path
+	lastSwitch                  time.Time  // time when the last switch was triggered
+	lastSeenRemoteUpdateCounter uint32     // last remote update counter that triggered a switch
+	scheduledSwitchTime         time.Time  // scheduledSwitchTime is set in state 2: the time at which we become ready (state 3).
+	readyExpirationTime         time.Time  // readyExpirationTime is set in state 3: if no new update arrives before this time, cancel ready state.
+}
+
+// NewLossAndPingAwareSelector creates a new LossAndPingAwareSelector.
+// The parameters are:
+//   - cutoff: e.g. 1.2 for 20% above the best latency,
+//   - inertia: minimum time between switches,
+//   - pingInterval and pingTimeout: parameters for the underlying ping selector,
+//   - lossMetrics: pointer to the LossMetrics instance.
+func NewLossAndPingAwareSelector(cutoffAbs, cutoffDiff, lossThreshold float64, inertia, pingInterval, pingTimeout time.Duration, lossMetrics *bwtest.LossMetrics) *LossAndPingAwareSelector {
+	// Instantiate the underlying ping selector.
+	ps := &PingingSelector{
+		Interval: pingInterval,
+		Timeout:  pingTimeout,
+		// Other fields will be set in Initialize.
+	}
+	// Do not call ensureRunning() here; it will be called in Initialize via SetActive.
+	return &LossAndPingAwareSelector{
+		pingSel:                     ps,
+		lossMetrics:                 lossMetrics,
+		cutoffAbs:                   cutoffAbs,
+		cutoffDiff:                  cutoffDiff,
+		inertia:                     inertia,
+		lossThreshold:               lossThreshold,
+		switchState:                 stateNormal,
+		lastSeenRemoteUpdateCounter: 0,
+	}
+}
+
+// WouldSwitch returns true if the average loss over the provided lossWindow exceeds the threshold
+// and the most recent loss is above the threshold.
+func (s *LossAndPingAwareSelector) WouldSwitch(lossWindow []float32) bool {
+	if len(lossWindow) == 0 {
+		return false
+	}
+	var sum float64
+	for _, loss := range lossWindow {
+		sum += float64(loss)
+	}
+	avgLoss := sum / float64(len(lossWindow))
+	return avgLoss > s.lossThreshold && lossWindow[len(lossWindow)-1] > float32(s.lossThreshold)
+}
+
 // getLatestLatency returns the most recent latency for path p toward destination dst.
 // It looks up the destination's latency samples in the global stats database.
 // If no valid latency is recorded for p, or if the path was notified down after the sample was taken,
 // it returns a very high duration (maxDuration).
 func getLatestLatency(dst scionAddr, p *Path) time.Duration {
 	const maxDuration = time.Duration(1<<63 - 1)
+
 	stats.mutex.RLock()
 	defer stats.mutex.RUnlock()
 
@@ -523,68 +591,150 @@ func CandidatePaths(dst scionAddr, paths []*Path, cutoff float64) []*Path {
 	return candidates
 }
 
-// Define the state constants for the LossAndPingAwareSelector.
-const (
-	stateNormal  = iota // 0: Normal operation.
-	stateInertia        // 1: In inertia period after a switch decision (or a decision not to switch).
-	stateWaiting        // 2: Random waiting period scheduled for switching.
-	stateReady          // 3: Ready-to-switch state (waiting for a new update to trigger immediate switch).
-)
+// getRobustCurrentRTT returns the median of the last three RTT measurements for path p toward dst.
+// If fewer than three samples are available, it uses all available samples.
+// If the newest down notification for p is later than the timestamp of the least recent sample, returns maxDuration.
+func getRobustCurrentRTT(dst scionAddr, p *Path) time.Duration {
+	numberOfMeasurements := 3
 
-type LossAndPingAwareSelector struct {
-	pingSel     *PingingSelector    // underlying ping selector (must be running and updating latencies)
-	lossMetrics *bwtest.LossMetrics // provides remote loss update information
+	stats.mutex.RLock()
+	defer stats.mutex.RUnlock()
 
-	cutoff        float64       // cutoff is the multiplicative factor; e.g., 1.2 means select all paths with latency ≤ 1.2× best.
-	inertia       time.Duration // minimum time between switches
-	lossThreshold float64       // loss percentage threshold for switching
+	dstStats, ok := stats.destinations[dst]
+	if !ok {
+		return maxDuration
+	}
+	samples, ok := dstStats.Latency[p.Fingerprint]
+	if !ok || len(samples) == 0 {
+		return maxDuration
+	}
 
-	mutex                       sync.Mutex // protects cachedPath and switching fields
-	switchState                 int        // current state of the selector
-	cachedPath                  *Path      // currently selected path
-	lastSwitch                  time.Time  // time when the last switch was triggered
-	lastSeenRemoteUpdateCounter uint32     // last remote update counter that triggered a switch
-	scheduledSwitchTime         time.Time  // scheduledSwitchTime is set in state 2: the time at which we become ready (state 3).
-	readyExpirationTime         time.Time  // readyExpirationTime is set in state 3: if no new update arrives before this time, cancel ready state.
+	// Use up to the last three samples.
+	n := len(samples)
+	count := numberOfMeasurements
+	if n < numberOfMeasurements {
+		count = n
+	}
+	window := make([]time.Duration, count)
+	for i := 0; i < count; i++ {
+		window[i] = samples[i].Value
+	}
+
+	// Check down notification: if newest down notification for p is after the timestamp of the least recent sample, consider it down.
+	newestDown := stats.newestDownNotification(p)
+	if newestDown.After(samples[count-1].Time) {
+		return maxDuration
+	}
+
+	// Sort the window to compute the median.
+	sort.Slice(window, func(i, j int) bool { return window[i] < window[j] })
+	medianRTT := window[count/2]
+
+	return medianRTT
 }
 
-// NewLossAndPingAwareSelector creates a new LossAndPingAwareSelector.
-// The parameters are:
-//   - cutoff: e.g. 1.2 for 20% above the best latency,
-//   - inertia: minimum time between switches,
-//   - pingInterval and pingTimeout: parameters for the underlying ping selector,
-//   - lossMetrics: pointer to the LossMetrics instance.
-func NewLossAndPingAwareSelector(cutoff, lossThreshold float64, inertia, pingInterval, pingTimeout time.Duration, lossMetrics *bwtest.LossMetrics) *LossAndPingAwareSelector {
-	// Instantiate the underlying ping selector.
-	ps := &PingingSelector{
-		Interval: pingInterval,
-		Timeout:  pingTimeout,
-		// Other fields will be set in Initialize.
+// getMinRTT returns the minimum RTT measured for path p toward dst by iterating over all samples.
+// This is of course highly ineffecient and must be replaced by some caching mechanism for anything beyond prototyping.
+func getMinRTT(dst scionAddr, p *Path) time.Duration {
+	stats.mutex.RLock()
+	defer stats.mutex.RUnlock()
+
+	dstStats, ok := stats.destinations[dst]
+	if !ok {
+		return maxDuration
 	}
-	// Do not call ensureRunning() here; it will be called in Initialize via SetActive.
-	return &LossAndPingAwareSelector{
-		pingSel:                     ps,
-		lossMetrics:                 lossMetrics,
-		cutoff:                      cutoff,
-		inertia:                     inertia,
-		lossThreshold:               lossThreshold,
-		switchState:                 stateNormal,
-		lastSeenRemoteUpdateCounter: 0,
+	samples, ok := dstStats.Latency[p.Fingerprint]
+	if !ok || len(samples) == 0 {
+		return maxDuration
 	}
+
+	minRTT := maxDuration
+	for _, sample := range samples {
+		if sample.Value < minRTT {
+			minRTT = sample.Value
+		}
+	}
+	return minRTT
 }
 
-// WouldSwitch returns true if the average loss over the provided lossWindow exceeds the threshold
-// and the most recent loss is above the threshold.
-func (s *LossAndPingAwareSelector) WouldSwitch(lossWindow []float32) bool {
-	if len(lossWindow) == 0 {
-		return false
+// CandidatePathsDual returns a candidate set of paths based on two criteria:
+// 1) Absolute RTT: The robust current RTT (median of last three samples) is within cutoffAbs times the best robust RTT among all paths.
+// 2) RTT difference: The difference (robust current RTT - min RTT) is within cutoffDiff times the smallest such difference among the absolute candidates.
+// If the intersection is empty, fall back to the absolute candidate set. If that too is empty, return all paths.
+func CandidatePathsDual(dst scionAddr, paths []*Path, cutoffAbs, cutoffDiff float64) []*Path {
+	// Step 1: Build the absolute candidate set.
+	type pathMetrics struct {
+		p    *Path
+		rtt  time.Duration // robust current RTT
+		diff time.Duration // current RTT - min RTT
 	}
-	var sum float64
-	for _, loss := range lossWindow {
-		sum += float64(loss)
+	var absCandidates []pathMetrics
+	bestRTT := maxDuration
+	for _, p := range paths {
+		rtt := getRobustCurrentRTT(dst, p)
+		if rtt < maxDuration {
+			if rtt < bestRTT {
+				bestRTT = rtt
+			}
+			// Compute RTT difference.
+			minRTT := getMinRTT(dst, p)
+			var diff time.Duration
+			if minRTT < maxDuration && rtt >= minRTT {
+				diff = rtt - minRTT
+			} else {
+				diff = maxDuration
+			}
+			absCandidates = append(absCandidates, pathMetrics{p: p, rtt: rtt, diff: diff})
+		}
 	}
-	avgLoss := sum / float64(len(lossWindow))
-	return avgLoss > s.lossThreshold && lossWindow[len(lossWindow)-1] > float32(s.lossThreshold)
+	// If no valid candidates, return all paths.
+	if len(absCandidates) == 0 {
+		return paths
+	}
+
+	absCutoffDuration := time.Duration(float64(bestRTT) * cutoffAbs)
+	var absSet []pathMetrics
+	now := time.Now()
+	fmt.Printf("[%v] Selector: Computing initial candidate set\n", now)
+	for _, pm := range absCandidates {
+		if pm.rtt <= absCutoffDuration {
+			absSet = append(absSet, pm)
+			fmt.Printf("[%v] Selector: Adding path %s to initial candidate set (lat: %v, lat diff: %v)\n",
+				now, pm.p.Fingerprint, pm.rtt, pm.diff)
+		}
+	}
+	// If absSet is empty (should not happen if at least one path is valid), fallback.
+	if len(absSet) == 0 {
+		absSet = absCandidates
+	}
+
+	// Step 2: Build the narrower candidate set based on RTT difference.
+	fmt.Printf("[%v] Selector: Computing the narrower candidate set\n", now)
+	bestDiff := maxDuration
+	for _, pm := range absSet {
+		if pm.diff < bestDiff {
+			bestDiff = pm.diff
+		}
+	}
+	diffCutoff := time.Duration(float64(bestDiff) * cutoffDiff)
+	var finalCandidates []*Path
+	for _, pm := range absSet {
+		if pm.diff <= diffCutoff {
+			finalCandidates = append(finalCandidates, pm.p)
+			fmt.Printf("[%v] Selector: Adding path %s to narrower candidate set (lat: %v, lat diff: %v)\n",
+				now, pm.p.Fingerprint, pm.rtt, pm.diff)
+		}
+	}
+
+	// Fallback: if final candidate set is empty, use the absolute candidate set.
+	// Actually, this should not ever happen with the relative difference cutoff.
+	if len(finalCandidates) == 0 {
+		finalCandidates = make([]*Path, len(absSet))
+		for i, pm := range absSet {
+			finalCandidates[i] = pm.p
+		}
+	}
+	return finalCandidates
 }
 
 // Initialize delegates initialization to the underlying ping selector,
@@ -672,8 +822,8 @@ func (s *LossAndPingAwareSelector) Path(ctx context.Context) *Path {
 			// For a small number of flows, simply use p = 1
 			p := 1.0
 			if rand.Float64() < p {
-				// Schedule a random switch time within inertia leaving 1s of buffer at both ends.
-				randomDelay := time.Second + time.Duration(rand.Int63n(int64(s.inertia-2*time.Second)))
+				// Schedule a random switch time within inertia leaving 2s to refresh latency measurements.
+				randomDelay := 2*time.Second + time.Duration(rand.Int63n(int64(s.inertia-2*time.Second)))
 				s.scheduledSwitchTime = now.Add(randomDelay)
 				// Transition to waiting state.
 				s.switchState = stateWaiting
@@ -720,7 +870,8 @@ func (s *LossAndPingAwareSelector) Path(ctx context.Context) *Path {
 			dst := s.pingSel.remote
 			s.pingSel.mutex.Unlock()
 			// Perform the switch now.
-			candidates := CandidatePaths(dst, pathsCopy, s.cutoff)
+			// candidates := CandidatePaths(dst, pathsCopy, s.cutoff)
+			candidates := CandidatePathsDual(dst, pathsCopy, s.cutoffAbs, s.cutoffDiff)
 			if len(candidates) > 0 {
 				newPath := candidates[rand.Intn(len(candidates))]
 				s.cachedPath = newPath
