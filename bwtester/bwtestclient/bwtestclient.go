@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"errors"
 	"flag"
 	"fmt"
@@ -32,6 +33,7 @@ import (
 
 	"github.com/netsec-ethz/scion-apps/bwtester/bwtest"
 	"github.com/netsec-ethz/scion-apps/pkg/pan"
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -267,6 +269,7 @@ func main() {
 		interactive  bool
 		sequence     string
 		preference   string
+		transport    string
 	)
 
 	flag.Usage = printUsage
@@ -279,6 +282,8 @@ func main() {
 	flag.StringVar(&preference, "preference", "", "Preference sorting order for paths. "+
 		"Comma-separated list of available sorting options: "+
 		strings.Join(pan.AvailablePreferencePolicies, "|"))
+	flag.StringVar(&transport, "transport", "udp",
+		"transport protocol: \"udp\" or \"quic\" (datagram over QUIC)")
 
 	flag.Parse()
 	flagset := make(map[string]bool)
@@ -320,7 +325,17 @@ func main() {
 	fmt.Printf("server->client: %d seconds, %d bytes, %d packets\n",
 		int(serverBwp.BwtestDuration/time.Second), serverBwp.PacketSize, serverBwp.NumPackets)
 
-	clientRes, serverRes, err := runBwtest(local.Get(), serverCCAddr, policy, clientBwp, serverBwp)
+	var clientRes, serverRes bwtest.Result
+	err = nil
+	if transport == "quic" {
+		clientRes, serverRes, err = runBwtestQuic(
+			local.Get(), serverCCAddr, policy, clientBwp, serverBwp,
+		)
+	} else {
+		clientRes, serverRes, err = runBwtestUDP(
+			local.Get(), serverCCAddr, policy, clientBwp, serverBwp,
+		)
+	}
 	bwtest.Check(err)
 
 	fmt.Println("\nS->C results")
@@ -330,7 +345,7 @@ func main() {
 }
 
 // runBwtest runs the bandwidth test with the given parameters against the server at serverCCAddr.
-func runBwtest(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy,
+func runBwtestUDP(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy,
 	clientBwp, serverBwp bwtest.Parameters) (clientRes, serverRes bwtest.Result, err error) {
 
 	// Control channel connection
@@ -394,6 +409,96 @@ func runBwtest(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Policy
 	dcConn.Close()
 
 	serverRes, err = requestResults(ccConn, clientBwp.PrgKey)
+	return
+}
+
+// runBwtestQuic runs the bandwidth test over QUIC datagrams instead of raw UDP.
+func runBwtestQuic(local netip.AddrPort,
+	serverCCAddr pan.UDPAddr,
+	policy pan.Policy,
+	clientBwp, serverBwp bwtest.Parameters,
+) (clientRes, serverRes bwtest.Result, err error) {
+
+	// 1) Control-channel connection (same as runBwtestUDP)
+	ccSelector := pan.NewDefaultSelector()
+	ccConn, err := pan.DialUDP(
+		context.Background(),
+		local,
+		serverCCAddr,
+		pan.WithPolicy(policy),
+		pan.WithSelector(ccSelector),
+	)
+	if err != nil {
+		return
+	}
+
+	// 2) QUIC datagram session setup
+	dcLocal := netip.AddrPortFrom(local.Addr(), 0)
+	serverDCAddr := serverCCAddr.WithPort(serverCCAddr.Port + 1)
+	tlsCfg := &tls.Config{
+		InsecureSkipVerify: true,
+		NextProtos:         []string{"quic-bwtest"},
+	}
+	quicCfg := &quic.Config{
+		EnableDatagrams: true,
+	}
+	dcSelector := pan.NewDefaultSelector()
+	sess, err := pan.DialQUIC(
+		context.Background(),
+		dcLocal,
+		serverDCAddr,
+		/*host=*/ "",
+		tlsCfg,
+		quicCfg,
+		pan.WithSelector(dcSelector),
+	)
+	if err != nil {
+		return
+	}
+
+	// Extract the ephemeral local port to include in the parameters (just for consistency with UDP)
+	serverBwp.Port = serverDCAddr.Port
+	clientDCAddr := sess.Conn.LocalAddr().(pan.UDPAddr)
+	clientBwp.Port = clientDCAddr.Port
+
+	// 3) Build a deadline covering both send and straggler waits
+	now := time.Now()
+	sendDL := now.Add(clientBwp.BwtestDuration + bwtest.GracePeriodSend)
+	recvDL := now.Add(serverBwp.BwtestDuration + bwtest.StragglerWaitPeriod)
+	maxDL := sendDL
+	if recvDL.After(maxDL) {
+		maxDL = recvDL
+	}
+	go func() {
+		time.Sleep(time.Until(maxDL))
+		sess.CloseWithError(0, "test done")
+	}()
+
+	// 4) Kick off the QUIC receive goroutine
+	ctx, cancel := context.WithDeadline(context.Background(), recvDL)
+	defer cancel()
+	recvCh := make(chan bwtest.Result, 1)
+	go func() {
+		recvCh <- bwtest.HandleDCConnReceiveQuic(serverBwp, sess, ctx)
+	}()
+
+	// 5) Send “new test” request to the server. Server will call startBwtestBackgroundQuic.
+	if err = requestNewBwtest(ccConn, clientBwp, serverBwp); err != nil {
+		sess.CloseWithError(0, "abort")
+		return
+	}
+
+	// 6) Blast datagrams at fixed slots, skipping any missed due to CC blocking
+	err = bwtest.HandleDCConnSendQuic(clientBwp, sess)
+	if errors.Is(err, &quic.DatagramTooLargeError{}) {
+		sess.CloseWithError(0, "abort")
+		return
+	}
+
+	// 7) Collect client-side stats and fetch server results over control channel
+	clientRes = <-recvCh
+	serverRes, err = requestResults(ccConn, clientBwp.PrgKey)
+	sess.CloseWithError(0, "client done")
 	return
 }
 
