@@ -17,6 +17,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net"
@@ -27,6 +28,8 @@ import (
 
 	"github.com/netsec-ethz/scion-apps/bwtester/bwtest"
 	"github.com/netsec-ethz/scion-apps/pkg/pan"
+	"github.com/netsec-ethz/scion-apps/pkg/quicutil"
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -35,14 +38,19 @@ const (
 
 func main() {
 	var listen pan.IPPortValue
+	var transport string
 	kingpin.Flag("listen", "Address to listen on").Default(":40002").SetValue(&listen)
+	kingpin.Flag("transport", "udp or quic (datagram over QUIC)").Default("udp").
+		StringVar(&transport)
+	kingpin.Parse() // re‐parse to pick up the transport flag
+
 	kingpin.Parse()
 
-	err := runServer(listen.Get())
+	err := runServer(listen.Get(), transport)
 	bwtest.Check(err)
 }
 
-func runServer(listen netip.AddrPort) error {
+func runServer(listen netip.AddrPort, transport string) error {
 	receivePacketBuffer := make([]byte, 2500)
 
 	var currentBwtest string
@@ -58,6 +66,49 @@ func runServer(listen netip.AddrPort) error {
 		return err
 	}
 	serverCCAddr := ccConn.LocalAddr().(pan.UDPAddr)
+
+	// --- QUIC pre-listener setup ---
+	// We’ll listen on the "data" port = control-plane port + 1.
+	var pendingSessions chan quic.Connection
+	var matchedSess quic.Connection
+	if transport == "quic" {
+		serverDCAddr := netip.AddrPortFrom(serverCCAddr.IP, serverCCAddr.Port+1)
+		dcSelector := pan.NewDefaultReplySelector()
+		tlsCfg := &tls.Config{
+			Certificates: quicutil.MustGenerateSelfSignedCert(),
+			NextProtos:   []string{"quic-bwtest"},
+		}
+		quicCfg := &quic.Config{
+			EnableDatagrams: true,
+		}
+		pendingSessions = make(chan quic.Connection, 8) // buffer for pending sessions
+		listenerQUIC, err := pan.ListenQUIC(
+			context.Background(),
+			serverDCAddr,
+			tlsCfg,
+			quicCfg,
+			pan.WithReplySelector(dcSelector), // reuse control-plane selector
+		)
+		if err != nil {
+			return err
+		}
+		// Accept loop: push each new session onto pendingSessions
+		go func() {
+			for {
+				sess, err := listenerQUIC.Accept(context.Background())
+				if err == quic.ErrServerClosed {
+					// Listener was closed, exit the loop
+					return
+				}
+				if err != nil {
+					continue
+				}
+				pendingSessions <- sess
+			}
+		}()
+	}
+	// --- end QUIC pre-listener ---
+
 	for {
 		// Handle client requests
 		n, clientCCAddr, err := ccConn.ReadFrom(receivePacketBuffer)
@@ -75,6 +126,10 @@ func runServer(listen netip.AddrPort) error {
 			results.insert(currentBwtest, res)
 			currentBwtest = ""
 			currentBwtestFinish = time.Time{}
+			if matchedSess != nil {
+				matchedSess.CloseWithError(0, "test finished")
+				matchedSess = nil
+			}
 		default:
 		}
 
@@ -103,8 +158,41 @@ func runServer(listen netip.AddrPort) error {
 				continue
 			}
 			path := ccSelector.Path(ctx, clientCCAddr.(pan.UDPAddr))
-			finishTime, err := startBwtestBackground(serverCCAddr, clientCCAddr.(pan.UDPAddr), path,
-				clientBwp, serverBwp, currentResult)
+			var finishTime time.Time
+			var found bool = false
+			if transport == "quic" {
+				// Try to find a session whose remote matches this client
+				wantedAddr := pan.UDPAddr{IA: clientCCAddr.(pan.UDPAddr).IA,
+					IP:   clientCCAddr.(pan.UDPAddr).IP,
+					Port: clientBwp.Port}
+				for {
+					sess, ok := <-pendingSessions
+					if !ok {
+						// No more sessions in the queue
+						break
+					}
+					sessAddr := sess.RemoteAddr().(pan.UDPAddr)
+					if wantedAddr == sessAddr {
+						matchedSess = sess
+						found = true
+						break
+					}
+				}
+				if !found {
+					// No matching session available right now → ask client to retry
+					err = fmt.Errorf("no pending QUIC session for client %s", clientCCAddr)
+				} else {
+					finishTime, err = startBwtestBackgroundQuic(
+						clientBwp, serverBwp, matchedSess, currentResult,
+					)
+				}
+			} else {
+				finishTime, err = startBwtestBackgroundUDP(
+					serverCCAddr, clientCCAddr.(pan.UDPAddr), path,
+					clientBwp, serverBwp, currentResult,
+				)
+			}
+
 			if err != nil {
 				// Ask the client to try again in 1 second
 				writeResponseN(ccConn, clientCCAddr, 1)
@@ -134,7 +222,7 @@ func runServer(listen netip.AddrPort) error {
 
 // startBwtestBackground starts a bandwidth test, in the background.
 // Returns the expected finish time of the test, or any error during the setup.
-func startBwtestBackground(serverCCAddr pan.UDPAddr, clientCCAddr pan.UDPAddr,
+func startBwtestBackgroundUDP(serverCCAddr pan.UDPAddr, clientCCAddr pan.UDPAddr,
 	path *pan.Path, clientBwp, serverBwp bwtest.Parameters, res chan<- bwtest.Result) (time.Time, error) {
 
 	// Data Connection addresses:
@@ -177,6 +265,43 @@ func startBwtestBackground(serverCCAddr pan.UDPAddr, clientCCAddr pan.UDPAddr,
 		res <- r
 	}()
 	return finishTime, nil
+}
+
+// startBwtestBackgroundQuic mirrors startBwtestBackgroundUDP but over QUIC datagrams.
+func startBwtestBackgroundQuic(
+	clientBwp, serverBwp bwtest.Parameters,
+	sess quic.Connection,
+	res chan<- bwtest.Result,
+) (time.Time, error) {
+	// Set deadlines for the connection
+	now := time.Now()
+	sendDL := now.Add(serverBwp.BwtestDuration + bwtest.GracePeriodSend)
+	recvDL := now.Add(clientBwp.BwtestDuration + bwtest.StragglerWaitPeriod)
+	finish := recvDL
+	if finish.Before(sendDL) {
+		finish = sendDL
+	}
+	go func() {
+		time.Sleep(time.Until(finish))
+		sess.CloseWithError(0, "test done")
+	}()
+
+	// Launch send and receive in parallel
+	ctx, cancel := context.WithDeadline(context.Background(), recvDL)
+	sendDone := make(chan struct{})
+	go func() {
+		_ = bwtest.HandleDCConnSendQuic(serverBwp, sess)
+		close(sendDone)
+	}()
+	go func() {
+		defer cancel()
+		r := bwtest.HandleDCConnReceiveQuic(clientBwp, sess, ctx)
+		<-sendDone
+		sess.CloseWithError(0, "server done")
+		res <- r
+	}()
+
+	return finish, nil
 }
 
 // writeResponseN writes the response to an 'N' (new bandwidth test) request.
