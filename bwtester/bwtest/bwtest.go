@@ -18,6 +18,7 @@ package bwtest
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"encoding/binary"
@@ -27,6 +28,8 @@ import (
 	"os"
 	"sort"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
 const (
@@ -172,6 +175,49 @@ func HandleDCConnSend(bwp Parameters, udpConnection io.Writer) error {
 	return nil
 }
 
+// HandleDCConnSendQuic blasts datagrams over QUICSession,
+// skipping any slot missed due to prior blocking.
+func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection) error {
+	sb := make([]byte, bwp.PacketSize)
+	t0 := time.Now()
+	// interval between packets in a fixed-duration run
+	var interval time.Duration
+	if bwp.NumPackets > 1 {
+		interval = bwp.BwtestDuration / time.Duration(bwp.NumPackets-1)
+	} else {
+		interval = bwp.BwtestDuration
+	}
+	deadline := t0.Add(bwp.BwtestDuration + GracePeriodSend)
+
+	filler := newPrgFiller(bwp.PrgKey)
+	for i := int64(0); ; i++ {
+		target := t0.Add(interval * time.Duration(i))
+		if target.After(deadline) {
+			// we're past the total test time
+			break
+		}
+		now := time.Now()
+		// if we've already missed *this* slot by more than one interval, skip it
+		if now.Sub(target) > interval {
+			continue
+		}
+		// else sleep until the slot
+		if d := time.Until(target); d > 0 {
+			time.Sleep(d)
+		}
+		// prepare packet
+		filler.Fill(int(i*bwp.PacketSize), sb)
+		binary.LittleEndian.PutUint32(sb, uint32(i*bwp.PacketSize))
+		// send (will block if QUIC CC window is full)
+		err := sess.SendDatagram(sb)
+		// println("Sent packet", i, "at", time.Now().Format(time.RFC3339Nano), "of length", len(sb), "with error", err, "at", sess.LocalAddr().String(), "to", sess.RemoteAddr().String())
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func HandleDCConnReceive(bwp Parameters, udpConnection io.Reader) Result {
 	var numPacketsReceived int64
 	var correctlyReceived int64
@@ -214,6 +260,51 @@ func HandleDCConnReceive(bwp Parameters, udpConnection io.Reader) Result {
 		PrgKey:             bwp.PrgKey,
 	}
 	res.IPAvar, res.IPAmin, res.IPAavg, res.IPAmax = aggrInterArrivalTime(interPacketArrivalTime)
+	return res
+}
+
+// HandleDCConnReceiveQuic mirrors HandleDCConnReceive but over a QUICSession.
+func HandleDCConnReceiveQuic(bwp Parameters, sess quic.Connection, ctx context.Context) Result {
+	var numReceived, correctlyReceived int64
+	times := make(map[int]int64, bwp.NumPackets)
+	cmpBuf := make([]byte, bwp.PacketSize)
+	filler := newPrgFiller(bwp.PrgKey)
+
+	for correctlyReceived < bwp.NumPackets {
+		select {
+		case <-ctx.Done():
+			// test deadline reached
+			goto done
+		default:
+		}
+		data, err := sess.ReceiveDatagram(ctx)
+		// println("Received packet", numReceived, "at", time.Now().Format(time.RFC3339Nano), "of length", len(data), "with error", err, "at", sess.LocalAddr().String(), "from", sess.RemoteAddr().String())
+		if err != nil {
+			// context deadline or session closed
+			break
+		}
+		n := len(data)
+		numReceived++
+		if int64(n) != bwp.PacketSize {
+			continue
+		}
+		iv := int64(binary.LittleEndian.Uint32(data[:4]))
+		seq := int(iv / bwp.PacketSize)
+		times[seq] = time.Now().UnixNano()
+		// check payload
+		filler.Fill(int(iv), cmpBuf)
+		binary.LittleEndian.PutUint32(cmpBuf, uint32(iv))
+		if bytes.Equal(data[:bwp.PacketSize], cmpBuf) {
+			correctlyReceived++
+		}
+	}
+done:
+	res := Result{
+		NumPacketsReceived: numReceived,
+		CorrectlyReceived:  correctlyReceived,
+		PrgKey:             bwp.PrgKey,
+	}
+	res.IPAvar, res.IPAmin, res.IPAavg, res.IPAmax = aggrInterArrivalTime(times)
 	return res
 }
 
