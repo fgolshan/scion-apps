@@ -290,7 +290,7 @@ func startBwtestBackgroundQuic(
 	ctx, cancel := context.WithDeadline(context.Background(), recvDL)
 	sendDone := make(chan struct{})
 	go func() {
-		_ = bwtest.HandleDCConnSendQuic(serverBwp, sess)
+		_ = bwtest.HandleDCConnSendQuic(serverBwp, sess, nil) // currently pass nil for PolarisCore
 		close(sendDone)
 	}()
 	go func() {

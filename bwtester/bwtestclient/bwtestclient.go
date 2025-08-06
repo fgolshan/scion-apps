@@ -47,6 +47,13 @@ const (
 	MaxTries               = 5 // Number of times to try to reach server
 	Timeout  time.Duration = time.Millisecond * 500
 	MaxRTT   time.Duration = time.Millisecond * 1000
+
+	// Constants for Polaris
+	Alpha          = 2.5              // margin factor to avoid unnecessary path switches, e.g. 1.5
+	ProbeInterval  = 1 * time.Second  // how often to send P-probes, e.g. 1s
+	StableTime     = 5 * time.Second  // amount of time a path needs to be a potential candidate, e.g. 5s
+	SwitchInterval = 10 * time.Second // minimum wait time after a path switch before allowing to switch again, e.g. 10s
+	logEnabled     = true             // whether to log path switch events and rate changes for traffic analysis
 )
 
 func prepareAESKey() []byte {
@@ -270,6 +277,7 @@ func main() {
 		sequence     string
 		preference   string
 		transport    string
+		selector     string
 	)
 
 	flag.Usage = printUsage
@@ -283,7 +291,9 @@ func main() {
 		"Comma-separated list of available sorting options: "+
 		strings.Join(pan.AvailablePreferencePolicies, "|"))
 	flag.StringVar(&transport, "transport", "udp",
-		"transport protocol: \"udp\" or \"quic\" (datagram over QUIC)")
+		"data channel transport protocol: \"udp\" or \"quic\" (datagram over QUIC)")
+	flag.StringVar(&selector, "selector", "default",
+		"data channel path selector: \"default\" or \"polaris\" (only with --transport=quic)")
 
 	flag.Parse()
 	flagset := make(map[string]bool)
@@ -298,6 +308,13 @@ func main() {
 	}
 	policy, err := pan.PolicyFromCommandline(sequence, preference, interactive)
 	checkUsageErr(err)
+
+	if (transport != "udp" && transport != "quic") ||
+		(selector != "default" && selector != "polaris") ||
+		(selector == "polaris" && transport != "quic") {
+		usageErr(fmt.Sprintf("invalid transport %q, selector %q, or combination of the two",
+			transport, selector))
+	}
 
 	// use default packet size when within same AS
 	inferedPktSize := int64(DefaultPktSize)
@@ -328,8 +345,9 @@ func main() {
 	var clientRes, serverRes bwtest.Result
 	err = nil
 	if transport == "quic" {
+		usePolaris := selector == "polaris"
 		clientRes, serverRes, err = runBwtestQuic(
-			local.Get(), serverCCAddr, policy, clientBwp, serverBwp,
+			local.Get(), serverCCAddr, policy, usePolaris, clientBwp, serverBwp,
 		)
 	} else {
 		clientRes, serverRes, err = runBwtestUDP(
@@ -415,7 +433,7 @@ func runBwtestUDP(local netip.AddrPort, serverCCAddr pan.UDPAddr, policy pan.Pol
 // runBwtestQuic runs the bandwidth test over QUIC datagrams instead of raw UDP.
 func runBwtestQuic(local netip.AddrPort,
 	serverCCAddr pan.UDPAddr,
-	policy pan.Policy,
+	policy pan.Policy, usePolaris bool,
 	clientBwp, serverBwp bwtest.Parameters,
 ) (clientRes, serverRes bwtest.Result, err error) {
 
@@ -442,7 +460,14 @@ func runBwtestQuic(local netip.AddrPort,
 	quicCfg := &quic.Config{
 		EnableDatagrams: true,
 	}
-	dcSelector := pan.NewDefaultSelector()
+	var dcSelector pan.Selector
+	var pc *pan.PolarisCore = nil
+	if usePolaris {
+		pc = pan.NewPolarisCore(Alpha, ProbeInterval, StableTime, SwitchInterval, logEnabled)
+		dcSelector = pan.NewPolarisSelector(pc)
+	} else {
+		dcSelector = pan.NewDefaultSelector()
+	}
 	sess, err := pan.DialQUIC(
 		context.Background(),
 		dcLocal,
@@ -453,6 +478,9 @@ func runBwtestQuic(local netip.AddrPort,
 		pan.WithSelector(dcSelector),
 	)
 	if err != nil {
+		if usePolaris {
+			pc.Close()
+		}
 		return
 	}
 
@@ -489,7 +517,7 @@ func runBwtestQuic(local netip.AddrPort,
 	}
 
 	// 6) Blast datagrams at fixed slots, skipping any missed due to CC blocking
-	err = bwtest.HandleDCConnSendQuic(clientBwp, sess)
+	err = bwtest.HandleDCConnSendQuic(clientBwp, sess, pc)
 	if errors.Is(err, &quic.DatagramTooLargeError{}) {
 		sess.CloseWithError(0, "abort")
 		return

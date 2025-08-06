@@ -35,6 +35,7 @@ type hostContext struct {
 	ia            IA
 	sciond        daemon.Connector
 	hostInLocalAS net.IP
+	topology      snet.Topology
 }
 
 const (
@@ -88,10 +89,29 @@ func initHostContext() (hostContext, error) {
 	if err != nil {
 		return hostContext{}, err
 	}
+	a, b, err := sciondConn.PortRange(ctx)
+	if err != nil {
+		return hostContext{}, err
+	}
+	interfaceMap, err := sciondConn.Interfaces(ctx)
+	if err != nil {
+		return hostContext{}, err
+	}
+	findInterface := func(ifID uint16) (netip.AddrPort, bool) {
+		addr, ok := interfaceMap[ifID]
+		return addr, ok
+	}
+	topo := snet.Topology{
+		LocalIA:   localIA,
+		PortRange: snet.TopologyPortRange{Start: a, End: b},
+		Interface: findInterface,
+	}
+
 	return hostContext{
 		ia:            IA(localIA),
 		sciond:        sciondConn,
 		hostInLocalAS: hostInLocalAS,
+		topology:      topo,
 	}, nil
 }
 

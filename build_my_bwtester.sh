@@ -3,7 +3,7 @@
 set -e  # Exit on error
 
 BIN="bin"
-TAGS="netgo"
+TAGS="netgo norains"
 STATIC_LDFLAGS='-extldflags "-static"'
 
 # Ensure the bin directory exists

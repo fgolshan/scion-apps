@@ -198,7 +198,7 @@ func (s *PingingSelector) ensureRunning() {
 	}
 	s.pingerCtx, s.pingerCancel = context.WithCancel(context.Background())
 	local := s.local.snetUDPAddr()
-	pinger, err := ping.NewPinger(s.pingerCtx, host.sciond, local)
+	pinger, err := ping.NewPinger(s.pingerCtx, host.topology, local)
 	if err != nil {
 		return
 	}
@@ -325,4 +325,35 @@ func (s *PingingSelector) Close() error {
 	}
 	s.pingerCancel()
 	return s.pinger.Close()
+}
+
+type PolarisSelector struct {
+	core *PolarisCore
+}
+
+func NewPolarisSelector(c *PolarisCore) *PolarisSelector {
+	return &PolarisSelector{
+		core: c,
+	}
+}
+
+func (s *PolarisSelector) Initialize(local, remote UDPAddr, paths []*Path) {
+	s.core.Initialize(local, remote, paths)
+}
+
+func (s *PolarisSelector) Path(ctx context.Context) *Path {
+	return s.core.ActivePath()
+}
+
+func (s *PolarisSelector) PathDown(pf PathFingerprint, pi PathInterface) {
+	s.core.HandlePathDown(string(pf))
+}
+
+func (s *PolarisSelector) Refresh(paths []*Path) {
+	panic("PolarisSelector does not yet support Refresh but Refresh has been called")
+}
+
+func (s *PolarisSelector) Close() error {
+	s.core.Close()
+	return nil
 }

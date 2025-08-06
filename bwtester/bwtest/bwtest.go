@@ -29,6 +29,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/netsec-ethz/scion-apps/pkg/pan"
 	"github.com/quic-go/quic-go"
 )
 
@@ -177,7 +178,7 @@ func HandleDCConnSend(bwp Parameters, udpConnection io.Writer) error {
 
 // HandleDCConnSendQuic blasts datagrams over QUICSession,
 // skipping any slot missed due to prior blocking.
-func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection) error {
+func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisCore) error {
 	sb := make([]byte, bwp.PacketSize)
 	t0 := time.Now()
 	// interval between packets in a fixed-duration run
@@ -210,9 +211,13 @@ func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection) error {
 		binary.LittleEndian.PutUint32(sb, uint32(i*bwp.PacketSize))
 		// send (will block if QUIC CC window is full)
 		err := sess.SendDatagram(sb)
-		// println("Sent packet", i, "at", time.Now().Format(time.RFC3339Nano), "of length", len(sb), "with error", err, "at", sess.LocalAddr().String(), "to", sess.RemoteAddr().String())
 		if err != nil {
 			return err
+		}
+		if pc != nil {
+			// if Polaris is used, update the core with the number of bytes sent
+			// this is used to infer the current bandwidth
+			pc.RecordSent(len(sb))
 		}
 	}
 	return nil
