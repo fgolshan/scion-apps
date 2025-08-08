@@ -49,7 +49,7 @@ const (
 	MaxRTT   time.Duration = time.Millisecond * 1000
 
 	// Constants for Polaris
-	Alpha          = 2.5              // margin factor to avoid unnecessary path switches, e.g. 1.5
+	Alpha          = 1.5              // margin factor to avoid unnecessary path switches, e.g. 1.5
 	ProbeInterval  = 1 * time.Second  // how often to send P-probes, e.g. 1s
 	StableTime     = 5 * time.Second  // amount of time a path needs to be a potential candidate, e.g. 5s
 	SwitchInterval = 10 * time.Second // minimum wait time after a path switch before allowing to switch again, e.g. 10s

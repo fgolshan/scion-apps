@@ -176,9 +176,49 @@ func HandleDCConnSend(bwp Parameters, udpConnection io.Writer) error {
 	return nil
 }
 
+func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisCore) error {
+	sb := make([]byte, bwp.PacketSize)
+	t0 := time.Now()
+	// interval between packets in a fixed-duration run
+	var interval time.Duration
+	if bwp.NumPackets > 1 {
+		interval = bwp.BwtestDuration / time.Duration(bwp.NumPackets-1)
+	} else {
+		interval = bwp.BwtestDuration
+	}
+	deadline := t0.Add(bwp.BwtestDuration + GracePeriodSend)
+
+	filler := newPrgFiller(bwp.PrgKey)
+	for i := int64(0); i < bwp.NumPackets; i++ {
+		target := t0.Add(interval * time.Duration(i))
+		if target.After(deadline) {
+			// we're past the total test time
+			break
+		}
+
+		if d := time.Until(target); d > 0 {
+			time.Sleep(d)
+		}
+		// prepare packet
+		filler.Fill(int(i*bwp.PacketSize), sb)
+		binary.LittleEndian.PutUint32(sb, uint32(i*bwp.PacketSize))
+		// send (will block if QUIC CC window is full)
+		err := sess.SendDatagram(sb)
+		if err != nil {
+			return err
+		}
+		if pc != nil {
+			// if Polaris is used, update the core with the number of bytes sent
+			// this is used to infer the current bandwidth
+			pc.RecordSent(len(sb))
+		}
+	}
+	return nil
+}
+
 // HandleDCConnSendQuic blasts datagrams over QUICSession,
 // skipping any slot missed due to prior blocking.
-func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisCore) error {
+/* func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisCore) error {
 	sb := make([]byte, bwp.PacketSize)
 	t0 := time.Now()
 	// interval between packets in a fixed-duration run
@@ -221,7 +261,7 @@ func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisC
 		}
 	}
 	return nil
-}
+} */
 
 func HandleDCConnReceive(bwp Parameters, udpConnection io.Reader) Result {
 	var numPacketsReceived int64
