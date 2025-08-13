@@ -91,7 +91,9 @@ func (c *PolarisCore) Initialize(local, remote UDPAddr, paths []*Path) {
 	c.paths = paths
 	// pick the first path as our starting point
 	if len(paths) > 0 {
-		c.activePath.Store(paths[0])
+		// c.activePath.Store(paths[0])
+		// try random initialization
+		c.activePath.Store(paths[rand.Intn(len(paths))])
 	} else {
 		return
 	}
