@@ -463,7 +463,8 @@ func runBwtestQuic(local netip.AddrPort,
 	var dcSelector pan.Selector
 	var pc *pan.PolarisCore = nil
 	if usePolaris {
-		pc = pan.NewPolarisCore(Alpha, ProbeInterval, StableTime, SwitchInterval, logEnabled)
+		targetRate := 8 * clientBwp.PacketSize * clientBwp.NumPackets / int64(clientBwp.BwtestDuration/time.Second)
+		pc = pan.NewPolarisCore(Alpha, ProbeInterval, StableTime, SwitchInterval, logEnabled, uint64(targetRate))
 		dcSelector = pan.NewPolarisSelector(pc)
 	} else {
 		dcSelector = pan.NewDefaultSelector()

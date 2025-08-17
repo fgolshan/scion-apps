@@ -23,6 +23,8 @@ import (
 	"github.com/x448/float16"
 )
 
+const TargetMissFactor = 0.98 // How much we can miss the target send rate without switching, e.g. 0.98 (98% of target)
+
 type ProbeState struct {
 	RequestTime   time.Time // when we sent the P-probe that last updated the path state
 	lastReplyTime time.Time // when we received the last P-probe reply
@@ -34,8 +36,10 @@ type PolarisCore struct {
 	paths      []*Path               // available paths
 	activePath *atomic.Pointer[Path] // currently active path
 
-	sendRateBps atomic.Uint64 // the estimated send rate on the current path, e.g. 1000000 (1 Mbps)
-	byteCounter atomic.Uint64 // bytes sent on the current path in the current second
+	sendRateBps       atomic.Uint64 // the estimated send rate on the current path, e.g. 1000000 (1 Mbps)
+	byteCounter       atomic.Uint64 // bytes sent on the current path in the current second
+	targetSendRateBps atomic.Uint64 // the target send rate on the current path, e.g. 1000000 (1 Mbps)
+	targetMissFactor  float64       // How much we can miss the target send rate without switching, e.g. 0.98 (98% of target)
 
 	alpha          float64       // margin factor to avoid unnecessary path switches, e.g. 1.5
 	stableTime     time.Duration // amount of time a path needs to be a potential candidate, e.g. 5s
@@ -61,6 +65,7 @@ func NewPolarisCore(alpha float64,
 	stableTime,
 	switchInterval time.Duration,
 	logEnabled bool,
+	targetSendRate uint64,
 ) *PolarisCore {
 	core := &PolarisCore{
 		activePath:     &atomic.Pointer[Path]{},
@@ -81,6 +86,9 @@ func NewPolarisCore(alpha float64,
 
 	core.prober = NewProber(core, probeInterval)
 
+	core.targetSendRateBps.Store(targetSendRate)
+	core.targetMissFactor = TargetMissFactor
+
 	return core
 }
 
@@ -91,9 +99,9 @@ func (c *PolarisCore) Initialize(local, remote UDPAddr, paths []*Path) {
 	c.paths = paths
 	// pick the first path as our starting point
 	if len(paths) > 0 {
-		// c.activePath.Store(paths[0])
+		c.activePath.Store(paths[0])
 		// try random initialization
-		c.activePath.Store(paths[rand.Intn(len(paths))])
+		// c.activePath.Store(paths[rand.Intn(len(paths))])
 	} else {
 		return
 	}
@@ -290,9 +298,36 @@ func (c *PolarisCore) maybeSwitch() {
 	if time.Since(c.lastSwitch) < c.switchInterval {
 		return
 	}
+
+	if float64(c.CurrentSendRate()) >= c.targetMissFactor*float64(c.GetTargetSendRate()) {
+		// If we are already at or above the target send rate reduced by a small margin, we can skip switching.
+		return
+	}
+
 	finals := c.finalCandidates()
-	// add current path as a canddiate unless down or congested
+	// Filter finals according to adaptive alpha criterium
+	n_paths_unfiltered := len(finals)
+	var maxEstimate uint64
+	finals, maxEstimate = c.filter_stable_switch(finals)
+	/*n_valids := 0
+	for _, ps := range c.probeState {
+		if time.Now().Sub(ps.lastReplyTime) <= c.probeValidity {
+			n_valids++
+		}
+	}*/
+
 	curFP := string(c.ActivePath().Fingerprint)
+	// Improved stability check:
+	// Do not switch if current path reports bw share just as good
+	// even if current sending rate is currently low
+	// In this case, the network is likely congested and we should not switch.
+	if ps, ok := c.probeState[string(curFP)]; ok {
+		if ps.lastEstimate >= maxEstimate {
+			return
+		}
+	}
+
+	// add current path as a candiate unless down or congested
 	_, congested := c.congested[curFP]
 	_, down := c.down[curFP]
 	if !congested && !down {
@@ -306,6 +341,7 @@ func (c *PolarisCore) maybeSwitch() {
 		}
 		if !found {
 			finals = append(finals, c.ActivePath())
+			n_paths_unfiltered++
 		}
 	}
 	if len(finals) > 0 {
@@ -318,20 +354,52 @@ func (c *PolarisCore) maybeSwitch() {
 				estimatedShare = ps.lastEstimate
 			}
 			evt := map[string]interface{}{
-				"ts":              float64(time.Now().UnixNano()) / 1e9,
-				"event":           "path_switch",
-				"trigger":         "scheduled",
-				"old":             string(oldPath.Fingerprint),
-				"new":             string(newPath.Fingerprint),
-				"candidates":      len(finals),
-				"estimated_share": estimatedShare,
-				"current_rate":    c.CurrentSendRate(),
+				"ts":                    float64(time.Now().UnixNano()) / 1e9,
+				"event":                 "path_switch",
+				"trigger":               "scheduled",
+				"old":                   string(oldPath.Fingerprint),
+				"new":                   string(newPath.Fingerprint),
+				"candidates":            len(finals),
+				"candidates_unfiltered": n_paths_unfiltered,
+				"estimated_share":       estimatedShare,
+				"max_estimated_share":   maxEstimate,
+				"current_rate":          c.CurrentSendRate(),
 			}
 			c.logEvent(evt)
 		}
 
 		c.switchToPath(newPath)
 	}
+}
+
+// filterFinalsByAlpha returns (filteredFinals, maxLastEstimate).
+// A path p is kept iff  float64(ps.lastEstimate) * c.alpha / r  >  float64(maxLastEstimate),
+// where maxLastEstimate is the maximum lastEstimate over all finals that have probe state.
+// We only keep paths that would not cause a switch again.
+func (c *PolarisCore) filter_stable_switch(finals []*Path) ([]*Path, uint64) {
+	// 1) Find max lastEstimate among finals
+	var maxLast uint64
+	for _, p := range finals {
+		key := string(p.Fingerprint)
+		if ps, ok := c.probeState[key]; ok {
+			if ps.lastEstimate > maxLast {
+				maxLast = ps.lastEstimate
+			}
+		}
+	}
+
+	// 2) Keep only those with lastEstimate * alpha / r > maxLast (strict)
+	filtered := make([]*Path, 0, len(finals))
+	r := 1.1 // stability factor
+	for _, p := range finals {
+		key := string(p.Fingerprint)
+		if ps, ok := c.probeState[key]; ok {
+			if float64(ps.lastEstimate)*c.alpha/r > float64(maxLast) {
+				filtered = append(filtered, p)
+			}
+		}
+	}
+	return filtered, maxLast
 }
 
 // Returns paths that have been potential candidates for at least stableTime
@@ -466,6 +534,17 @@ func (c *PolarisCore) updateSinglePathPotential(fp string) {
 	}
 }
 
+// SetTargetSendRate updates the Polaris core on the target send rate.
+// This avoids unnecessary path switches, if we are already sending at the target rate.
+func (c *PolarisCore) SetTargetSendRate(rateBps uint64) {
+	c.targetSendRateBps.Store(rateBps)
+}
+
+// GetTargetSendRate returns the target send rate in bits per second.
+func (c *PolarisCore) GetTargetSendRate() uint64 {
+	return c.targetSendRateBps.Load()
+}
+
 // RecordSent must be called after each successful packet send.
 // It tracks bytes in a 1-second window to estimate the real send rate.
 func (c *PolarisCore) RecordSent(nBytes int) {
@@ -536,6 +615,8 @@ func NewProber(core *PolarisCore,
 func (p *Prober) Initialize(local, remote UDPAddr, paths []*Path) error {
 	p.paths = paths
 	p.lastReqTime = make(map[PathFingerprint]time.Time, len(paths))
+	// DEBUG
+	fmt.Printf("Polaris prober initialized with %d paths\n", len(paths))
 
 	// Open a raw SCION socket to send P-probes and receive replies
 	host, err := getHost()
@@ -638,8 +719,8 @@ func (p *Prober) handleReply(pkt *snet.Packet, path snet.RawPath, received time.
 	case snet.SCMPEchoReply:
 		// DEBUG
 		// fmt.Println("Received SCMP echo reply")
-		// Only accept replies from current or last round of P-probes.
-		if s.SeqNumber != p.seq && s.SeqNumber != p.seq-1 {
+		// Only accept replies from current or previous round of P-probes.
+		if s.SeqNumber > p.seq || s.SeqNumber < p.seq-1 {
 			// DEBUG
 			fmt.Printf("Received SCMP echo reply with unexpected seq %d, expected %d or %d\n",
 				s.SeqNumber, p.seq, p.seq-1)
@@ -664,7 +745,7 @@ func (p *Prober) handleReply(pkt *snet.Packet, path snet.RawPath, received time.
 		// 	string(pf), s.Identifier, s.SeqNumber, estimatedBps)
 	case snet.SCMPPCongestionAlert:
 		// DEBUG
-		if s.SequenceNumber != p.seq && s.SequenceNumber != p.seq-1 {
+		if s.SequenceNumber > p.seq || s.SequenceNumber < p.seq-1 {
 			// DEBUG
 			fmt.Printf("Received P-CA alert with unexpected seq %d, expected %d or %d\n",
 				s.SequenceNumber, p.seq, p.seq-1)
@@ -698,6 +779,8 @@ func (p *Prober) run() {
 			for _, pt := range p.paths {
 				p.sendProbe(pt)
 			}
+			// DEBUG
+			// fmt.Printf("Sent P-probes for all %d paths at seq %d\n", len(p.paths), p.seq)
 		case reply := <-p.replies:
 			if reply.Error != nil {
 				continue
