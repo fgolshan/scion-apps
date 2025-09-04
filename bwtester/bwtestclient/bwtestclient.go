@@ -518,7 +518,8 @@ func runBwtestQuic(local netip.AddrPort,
 	}
 
 	// 6) Blast datagrams at fixed slots, skipping any missed due to CC blocking
-	err = bwtest.HandleDCConnSendQuic(clientBwp, sess, pc)
+	var sent int64
+	sent, err = bwtest.HandleDCConnSendQuic(clientBwp, sess, pc)
 	if errors.Is(err, &quic.DatagramTooLargeError{}) {
 		sess.CloseWithError(0, "abort")
 		return
@@ -528,6 +529,12 @@ func runBwtestQuic(local netip.AddrPort,
 	clientRes = <-recvCh
 	serverRes, err = requestResults(ccConn, clientBwp.PrgKey)
 	sess.CloseWithError(0, "client done")
+
+	// 8) Print network loss rate for comparison with application loss rate
+	fmt.Printf("Client sent %d packets, server reported %d packets received\n", sent, serverRes.CorrectlyReceived)
+	networkLossRate := float64(sent-serverRes.CorrectlyReceived) * 100.0 / float64(sent)
+	fmt.Printf("The network loss rate from client to server is %.1f%%\n", networkLossRate)
+
 	return
 }
 

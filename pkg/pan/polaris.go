@@ -318,11 +318,12 @@ func (c *PolarisCore) maybeSwitch() {
 
 	curFP := string(c.ActivePath().Fingerprint)
 	// Improved stability check:
-	// Do not switch if current path reports bw share just as good
+	// Do not switch if current path reports bw share just as good as best candidate,
 	// even if current sending rate is currently low
 	// In this case, the network is likely congested and we should not switch.
 	if ps, ok := c.probeState[string(curFP)]; ok {
 		if ps.lastEstimate >= maxEstimate {
+			fmt.Printf("Skipping switch: current path %s has lastEstimate %d >= maxEstimate %d\n", curFP, ps.lastEstimate, maxEstimate)
 			return
 		}
 	}

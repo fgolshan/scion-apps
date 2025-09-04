@@ -176,7 +176,7 @@ func HandleDCConnSend(bwp Parameters, udpConnection io.Writer) error {
 	return nil
 }
 
-func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisCore) error {
+func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisCore) (int64, error) {
 	sb := make([]byte, bwp.PacketSize)
 	t0 := time.Now()
 	// interval between packets in a fixed-duration run
@@ -189,6 +189,7 @@ func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisC
 	deadline := t0.Add(bwp.BwtestDuration + GracePeriodSend)
 
 	filler := newPrgFiller(bwp.PrgKey)
+	sent := int64(0)
 	for i := int64(0); i < bwp.NumPackets; i++ {
 		target := t0.Add(interval * time.Duration(i))
 		if target.After(deadline) {
@@ -205,15 +206,16 @@ func HandleDCConnSendQuic(bwp Parameters, sess quic.Connection, pc *pan.PolarisC
 		// send (will block if QUIC CC window is full)
 		err := sess.SendDatagram(sb)
 		if err != nil {
-			return err
+			return sent, err
 		}
+		sent++
 		if pc != nil {
 			// if Polaris is used, update the core with the number of bytes sent
 			// this is used to infer the current bandwidth
 			pc.RecordSent(len(sb))
 		}
 	}
-	return nil
+	return sent, nil
 }
 
 // HandleDCConnSendQuic blasts datagrams over QUICSession,
