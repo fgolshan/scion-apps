@@ -166,7 +166,7 @@ func (c *PolarisCore) switchToPath(path *Path) {
 
 // HandlePCA marks a path as congested when a P-CA alert is received, and removes it from potential candidates.
 // If the P-CA alert is for the currently active path, it may trigger a switch to another path, if there is a candidate available.
-func (c *PolarisCore) HandlePCA(pathFP string) {
+func (c *PolarisCore) HandlePCA(pathFP string, alert *snet.SCMPPCongestionAlert) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.congested[pathFP] = struct{}{}
@@ -182,14 +182,18 @@ func (c *PolarisCore) HandlePCA(pathFP string) {
 				estimatedShare = ps.lastEstimate
 			}
 			evt := map[string]interface{}{
-				"ts":              float64(time.Now().UnixNano()) / 1e9,
-				"event":           "path_switch",
-				"trigger":         "P-CA",
-				"old":             string(oldPath.Fingerprint),
-				"new":             string(newPath.Fingerprint),
-				"candidates":      len(alts),
-				"estimated_share": estimatedShare,
-				"current_rate":    c.CurrentSendRate(),
+				"ts":                  float64(time.Now().UnixNano()) / 1e9,
+				"event":               "path_switch",
+				"trigger":             "P-CA",
+				"pca_code":            alert.Code,
+				"pca_origin":          alert.ASIdentifier,
+				"pca_ifid":            alert.InterfaceID,
+				"pca_sequence_number": alert.SequenceNumber,
+				"old":                 string(oldPath.Fingerprint),
+				"new":                 string(newPath.Fingerprint),
+				"candidates":          len(alts),
+				"estimated_share":     estimatedShare,
+				"current_rate":        c.CurrentSendRate(),
 			}
 			c.logEvent(evt)
 
@@ -578,6 +582,192 @@ func (c *PolarisCore) Close() {
 	})
 }
 
+// ---------------- TE Additions ------------------
+// pathInterfaces returns the path interface sequence from the dataplane path.
+func (c *PolarisCore) pathInterfaces(p *Path) ([]PathInterface, bool) {
+	if p == nil || p.ForwardingPath.dataplanePath == nil {
+		return nil, false
+	}
+	md := p.Metadata.Interfaces
+	if md == nil {
+		return nil, false
+	}
+	return md, true
+}
+
+// hasPrefix returns true iff 'ifs' starts with 'prefix' exactly (IA + IfID).
+func hasPrefix(ifs, prefix []PathInterface) bool {
+	if len(ifs) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if ifs[i].IA != prefix[i].IA || ifs[i].IfID != prefix[i].IfID {
+			return false
+		}
+	}
+	return true
+}
+
+// HandlePCASwitchTo processes a SwitchToIfID P-CA for the current path.
+// It prefers paths with the same prefix up to the origin AS ingress with the requested egress IfID appended,
+// as long as they are up/not-congested and have an estimated bandwidth >= current path's bandwidth.
+func (c *PolarisCore) HandlePCASwitchTo(pathFP string, alert *snet.SCMPPCongestionAlert) {
+	origin := alert.ASIdentifier
+	reqEgressIfID := alert.InterfaceID
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Mark the path as congested either way.
+	c.congested[pathFP] = struct{}{}
+	delete(c.potentialSince, pathFP)
+	// Only continue if the SwitchToIfID P-CA was received for the current path.
+	cur := c.ActivePath()
+	if cur == nil || string(cur.Fingerprint) != pathFP {
+		// DEBUG
+		fmt.Printf("Ignoring SwitchToIfID P-CA for non-current path %s (current: %s)\n",
+			pathFP, cur.Fingerprint)
+		return
+	}
+
+	// Build the "prefix + requested egress" pattern from the current path.
+	curIfs, ok := c.pathInterfaces(cur)
+	if !ok || len(curIfs) == 0 {
+		// No metadata; fall back.
+		c.switchAwayLikeDefaultPCA(alert, "no_metadata")
+		return
+	}
+
+	// Find the first and only occurrence of the origin AS in the interface list; treat it as ingress position.
+	ingressIdx := -1
+	for i, pi := range curIfs {
+		if addr.IA(pi.IA).Equal(origin) {
+			ingressIdx = i
+			break
+		}
+	}
+	if ingressIdx < 0 {
+		// Could not locate origin AS in the current path; fall back.
+		c.switchAwayLikeDefaultPCA(alert, "AS_not_found")
+		return
+	}
+
+	// Prefix: everything up to and including the ingress of origin AS, plus the requested egress of origin AS.
+	var prefix []PathInterface
+	if ingressIdx > 0 {
+		// For the special case of the source AS being the origin AS, the index is pointing to the egress already (nothing to append).
+		prefix = append(prefix, curIfs[:ingressIdx+1]...)
+	}
+	prefix = append(prefix, PathInterface{IA: IA(origin), IfID: IfID(reqEgressIfID)})
+
+	// Collect candidate paths that start with this prefix, are up/non-congested, and meet the bandwidth constraint.
+	var candidates []*Path
+	for _, p := range c.paths {
+		if string(p.Fingerprint) == pathFP {
+			continue // exclude the current path itself
+		}
+		// Up & not congested?
+		pfp := string(p.Fingerprint)
+		if _, isDown := c.down[pfp]; isDown {
+			continue
+		}
+		if _, isCong := c.congested[pfp]; isCong {
+			continue
+		}
+		// Prefix match?
+		ifs, ok := c.pathInterfaces(p)
+		if !ok || !hasPrefix(ifs, prefix) {
+			continue
+		}
+		// Bandwidth >= current send rate? (might want a more refined criterium here)
+		if ps, ok := c.probeState[pfp]; ok {
+			if ps.lastEstimate >= c.CurrentSendRate() {
+				candidates = append(candidates, p)
+			}
+		}
+	}
+
+	if len(candidates) == 0 {
+		// No strict matches; fall back.
+		c.switchAwayLikeDefaultPCA(alert, "no_candidates")
+		return
+	}
+
+	// Choose uniformly at random among candidates.
+	newPath := candidates[rand.Intn(len(candidates))]
+
+	// Log and switch.
+	oldPath := c.ActivePath()
+	var estimatedShare interface{} = nil
+	if ps, ok := c.probeState[string(newPath.Fingerprint)]; ok {
+		estimatedShare = ps.lastEstimate
+	}
+	evt := map[string]interface{}{
+		"ts":                   float64(time.Now().UnixNano()) / 1e9,
+		"event":                "path_switch",
+		"trigger":              "P-CA",
+		"pca_code":             uint8(alert.Code()),
+		"pca_origin":           alert.ASIdentifier.String(),
+		"pca_ifid":             uint16(alert.InterfaceID),
+		"pca_sequence_number":  uint16(alert.SequenceNumber),
+		"old":                  string(oldPath.Fingerprint),
+		"new":                  string(newPath.Fingerprint),
+		"candidates":           len(candidates),
+		"success_switchToIfID": true,
+		"estimated_share":      estimatedShare,
+		"current_rate":         c.CurrentSendRate(),
+	}
+	c.logEvent(evt)
+	// DEBUG
+	fmt.Printf("SwitchToIfID P-CA (request granted): switching from %s to %s (candidates: %d)\n",
+		string(oldPath.Fingerprint), string(newPath.Fingerprint), len(candidates))
+
+	c.switchToPath(newPath)
+}
+
+// Helper that encapsulates default P-CA switching behavior for when SwitchToIfID cannot be fulfilled.
+func (c *PolarisCore) switchAwayLikeDefaultPCA(alert *snet.SCMPPCongestionAlert, failureReason string) {
+	alts := c.finalCandidates()
+	if len(alts) > 0 {
+		newPath := alts[rand.Intn(len(alts))]
+		// log the path switch event for traffic analysis
+		oldPath := c.ActivePath()
+		var estimatedShare interface{} = nil
+		if ps, ok := c.probeState[string(newPath.Fingerprint)]; ok {
+			estimatedShare = ps.lastEstimate
+		}
+		evt := map[string]interface{}{
+			"ts":                   float64(time.Now().UnixNano()) / 1e9,
+			"event":                "path_switch",
+			"trigger":              "P-CA",
+			"pca_code":             uint8(alert.Code()),
+			"pca_origin":           alert.ASIdentifier.String(),
+			"pca_ifid":             uint16(alert.InterfaceID),
+			"pca_sequence_number":  uint16(alert.SequenceNumber),
+			"old":                  string(oldPath.Fingerprint),
+			"new":                  string(newPath.Fingerprint),
+			"candidates":           len(alts),
+			"success_switchToIfID": false,
+			"failure_reason":       failureReason,
+			"estimated_share":      estimatedShare,
+			"current_rate":         c.CurrentSendRate(),
+		}
+		c.logEvent(evt)
+		// DEBUG
+		fmt.Printf("SwitchToIfID P-CA (request denied): switching from %s to %s (candidates: %d)\n",
+			string(oldPath.Fingerprint), string(newPath.Fingerprint), len(alts))
+
+		c.switchToPath(newPath)
+
+	} else {
+		// DEBUG
+		fmt.Printf("SwitchToIfID P-CA request denied and no switch, no candidates\n")
+		fmt.Printf("Reason: %s\n", failureReason)
+	}
+}
+
+//---------------- End TE Additions ------------------
+
 // Prober opens its own raw SCION socket to send P-probe SCMPs,
 // and to receive probe replies, P-CA alerts and SCMP path down alerts.
 type Prober struct {
@@ -674,6 +864,16 @@ func (p *Prober) sendProbe(pt *Path) {
 		BottleneckShare:   float16.Inf(0),
 	}
 
+	// Mark data-path probes with code=1, others with code=0
+	if p.core != nil && p.core.ActivePath() != nil &&
+		pt.Fingerprint == p.core.ActivePath().Fingerprint {
+		// This probe is on the *current data path*
+		pl.SetCode(slayers.SCMPCodePolarisProbeRequestDataPath) // = 1
+	} else {
+		// Explicitly mark other probes as the default variant
+		pl.SetCode(slayers.SCMPCodePolarisProbeRequest) // = 0 (optional, explicit)
+	}
+
 	remote := p.remote.snetUDPAddr()
 	remote.Path = pt.ForwardingPath.dataplanePath
 	remote.NextHop = net.UDPAddrFromAddrPort(pt.ForwardingPath.underlay)
@@ -704,66 +904,64 @@ func (p *Prober) sendProbe(pt *Path) {
 		}
 	}
 	// DEBUG
-	// fmt.Printf("Sent P-probe for path %s, reqID %d, seq %d\n", pt.Fingerprint, p.id, p.seq)
+	// fmt.Printf("Sent P-probe for path %s, reqID %d, seq %d, code %d\n", pt.Fingerprint, p.id, p.seq, pl.Code())
 }
 
-func (p *Prober) handleReply(pkt *snet.Packet, path snet.RawPath, received time.Time) {
-	// DEBUG
-	// fmt.Println("Received SCMP reply")
-	pf, err := reversePathFingerprint(path)
-	if err != nil {
-		// DEBUG
-		fmt.Printf("Failed to reverse path fingerprint: %v\n", err)
-		return
-	}
-	switch s := pkt.Payload.(type) {
-	case snet.SCMPEchoReply:
+func (p *Prober) handleReply(reply Reply) {
+	switch reply.Type {
+	case ReplyEcho:
 		// DEBUG
 		// fmt.Println("Received SCMP echo reply")
 		// Only accept replies from current or previous round of P-probes.
-		if s.SeqNumber > p.seq || s.SeqNumber < p.seq-1 {
+		if reply.SeqNo > p.seq || reply.SeqNo < p.seq-1 {
 			// DEBUG
 			fmt.Printf("Received SCMP echo reply with unexpected seq %d, expected %d or %d\n",
-				s.SeqNumber, p.seq, p.seq-1)
+				reply.SeqNo, p.seq, p.seq-1)
 			return
 		}
-		sent, ok := p.lastReqTime[pf]
+		sent, ok := p.lastReqTime[reply.PathFp]
 		if !ok {
 			// DEBUG
-			fmt.Printf("No last request time found for path %s\n", pf)
+			fmt.Printf("No last request time found for path %s\n", reply.PathFp)
 			return
 		}
-		var scmpPp slayers.SCMPPProbeRequest
-		if err := scmpPp.DecodeFromBytes(s.Payload, gopacket.NilDecodeFeedback); err != nil {
-			// DEBUG
-			fmt.Printf("Failed to decode SCMP P-probe reply: %v\n", err)
-			return
-		}
-		estimatedBps := uint64(float64(scmpPp.BottleneckShare.Float32()) * 1000) // convert from kbps to bps
-		p.core.HandleProbeReply(string(pf), estimatedBps, sent, received)
+		estimatedBps := uint64(float64(reply.ShareKbps) * 1000) // convert from kbps to bps
+		p.core.HandleProbeReply(string(reply.PathFp), estimatedBps, sent, reply.Received)
 		// DEBUG
 		// fmt.Printf("Received P-probe reply for path %s, reqID %d, seq %d, estimated share %d bps\n",
 		// 	string(pf), s.Identifier, s.SeqNumber, estimatedBps)
-	case snet.SCMPPCongestionAlert:
+	case ReplyPCA:
 		// DEBUG
-		if s.SequenceNumber > p.seq || s.SequenceNumber < p.seq-1 {
+		if reply.SeqNo > p.seq || reply.SeqNo < p.seq-1 {
 			// DEBUG
 			fmt.Printf("Received P-CA alert with unexpected seq %d, expected %d or %d\n",
-				s.SequenceNumber, p.seq, p.seq-1)
+				reply.SeqNo, p.seq, p.seq-1)
 			return
 		}
-		p.core.HandlePCA(string(pf))
+		// TE addition: Handle according to code
+		code := reply.Code
+		pfp := string(reply.PathFp)
+		switch code {
+		case slayers.SCMPCodePolarisCongestionAlertSwitchToIfID: // = 1
+			// s.ASIdentifier is the origin IA; s.InterfaceID is the requested egress IfID.
+			p.core.HandlePCASwitchTo(pfp, reply.PCA)
+			// DEBUG
+			fmt.Printf("Received P-CA SwitchTo for path %s: origin %s, IfID %d (reqID %d, seq %d)\n",
+				pfp, reply.PCA.ASIdentifier, reply.PCA.InterfaceID, reply.PCA.RequestIdentifier, reply.PCA.SequenceNumber)
+		default:
+			p.core.HandlePCA(pfp, reply.PCA)
+			// DEBUG
+			fmt.Printf("Received default P-CA for path %s, from AS %s, IfID %d (reqID %d, seq %d)\n",
+				pfp, reply.PCA.ASIdentifier, reply.PCA.InterfaceID, reply.PCA.RequestIdentifier, reply.PCA.SequenceNumber)
+		}
+	case ReplyExternalDown:
+		p.core.HandlePathDown(string(reply.PathFp))
 		// DEBUG
-		fmt.Printf("Received P-CA alert for path %s, reqID %d, seq %d\n",
-			string(pf), s.RequestIdentifier, s.SequenceNumber)
-	case snet.SCMPExternalInterfaceDown:
-		p.core.HandlePathDown(string(pf))
+		fmt.Printf("Received SCMP external interface down for path %s\n", reply.PathFp)
+	case ReplyInternalDown:
+		p.core.HandlePathDown(string(reply.PathFp))
 		// DEBUG
-		fmt.Printf("Received SCMP external interface down for path %s\n", pf)
-	case snet.SCMPInternalConnectivityDown:
-		p.core.HandlePathDown(string(pf))
-		// DEBUG
-		fmt.Printf("Received SCMP internal connectivity down for path %s\n", pf)
+		fmt.Printf("Received SCMP internal connectivity down for path %s\n", reply.PathFp)
 	}
 }
 
@@ -784,9 +982,11 @@ func (p *Prober) run() {
 			// fmt.Printf("Sent P-probes for all %d paths at seq %d\n", len(p.paths), p.seq)
 		case reply := <-p.replies:
 			if reply.Error != nil {
+				// DEBUG (just log and skip)
+				fmt.Printf("Error in SCMP handler: %v\n", reply.Error)
 				continue
 			}
-			p.handleReply(reply.Packet, reply.Path, reply.Received)
+			p.handleReply(reply)
 		}
 	}
 }
@@ -829,11 +1029,25 @@ func (p *Prober) Stop() {
 	})
 }
 
+type ReplyType int
+
+const (
+	ReplyUnknown ReplyType = iota
+	ReplyEcho
+	ReplyPCA
+	ReplyExternalDown
+	ReplyInternalDown
+)
+
 type Reply struct {
-	Received time.Time
-	Packet   *snet.Packet
-	Path     snet.RawPath
-	Error    error
+	Type      ReplyType
+	Received  time.Time
+	PathFp    PathFingerprint
+	Code      slayers.SCMPCode
+	SeqNo     uint16
+	ShareKbps float32                    // only for ReplyEcho
+	PCA       *snet.SCMPPCongestionAlert // only for ReplyPCA
+	Error     error
 }
 
 type PolarisSCMPHandler struct {
@@ -843,13 +1057,53 @@ type PolarisSCMPHandler struct {
 func (h *PolarisSCMPHandler) Handle(pkt *snet.Packet) error {
 	// DEBUG
 	// fmt.Println("PolarisSCMPHandler received packet")
-	err := h.handle(pkt)
-	h.replies <- Reply{
-		Received: time.Now(),
-		Packet:   pkt,
-		Path:     pkt.Path.(snet.RawPath),
-		Error:    err,
+	reply := Reply{Received: time.Now()}
+	var raw snet.RawPath
+	var pf PathFingerprint
+	var err error
+	var ok bool
+	if err = h.handle(pkt); err != nil {
+		reply.Error = fmt.Errorf("failed to handle packet: %v", err)
+		goto Done
 	}
+	if raw, ok = pkt.Path.(snet.RawPath); !ok {
+		reply.Error = fmt.Errorf("unexpected path type %T", pkt.Path)
+		goto Done
+	}
+	if pf, err = reversePathFingerprint(raw); err != nil {
+		reply.Error = fmt.Errorf("failed to reverse path fingerprint: %v", err)
+		goto Done
+	}
+	reply.PathFp = pf
+
+	switch s := pkt.Payload.(type) {
+	case snet.SCMPEchoReply:
+		reply.Type = ReplyEcho
+		var scmpPp slayers.SCMPPProbeRequest
+		if err := scmpPp.DecodeFromBytes(s.Payload, gopacket.NilDecodeFeedback); err != nil {
+			reply.Error = fmt.Errorf("failed to decode SCMP P-probe reply: %v", err)
+			goto Done
+		}
+		reply.SeqNo = s.SeqNumber
+		reply.ShareKbps = scmpPp.BottleneckShare.Float32()
+	case snet.SCMPPCongestionAlert:
+		reply.Type = ReplyPCA
+		reply.Code = s.Code()
+		reply.SeqNo = s.SequenceNumber
+		// copy to avoid data races
+		var sCopy snet.SCMPPCongestionAlert = s
+		reply.PCA = &sCopy
+	case snet.SCMPExternalInterfaceDown:
+		reply.Type = ReplyExternalDown
+	case snet.SCMPInternalConnectivityDown:
+		reply.Type = ReplyInternalDown
+	default:
+		reply.Type = ReplyUnknown
+		reply.Error = fmt.Errorf("unknown SCMP payload type %T", pkt.Payload)
+	}
+
+Done:
+	h.replies <- reply
 	return nil
 }
 
