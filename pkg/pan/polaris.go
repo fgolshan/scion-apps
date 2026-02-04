@@ -313,6 +313,8 @@ func (c *PolarisCore) maybeSwitch() {
 	n_paths_unfiltered := len(finals)
 	var maxEstimate uint64
 	finals, maxEstimate = c.filter_stable_switch(finals)
+	// Test without adaptive alpha filtering
+	// _, maxEstimate = c.filter_stable_switch(finals)
 	/*n_valids := 0
 	for _, ps := range c.probeState {
 		if time.Now().Sub(ps.lastReplyTime) <= c.probeValidity {
@@ -683,6 +685,13 @@ func (c *PolarisCore) HandlePCASwitchTo(pathFP string, alert *snet.SCMPPCongesti
 		if ps, ok := c.probeState[pfp]; ok {
 			if ps.lastEstimate >= c.CurrentSendRate() {
 				candidates = append(candidates, p)
+			} else {
+				if cps, ok := c.probeState[string(cur.Fingerprint)]; ok {
+					// Currently allow this relaxed condition to deal with underestimates of alternative path bandwidth.
+					if ps.lastEstimate >= cps.lastEstimate {
+						candidates = append(candidates, p)
+					}
+				}
 			}
 		}
 	}
